@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -19,11 +20,23 @@ BASE_DIR = Path(__file__).parent
 HISTORY_PATH = BASE_DIR / "trade_history_long.csv"
 MAPPING_PATH = BASE_DIR / "config" / "item_mapping.csv"
 FAVORITES_PATH = BASE_DIR / "favorites.json"
+MAPPING_COLUMNS = ["item_name", "category", "related_companies", "hs_code"]
 
 # 최소 이 개월수 미만의 데이터만 있는 품목은 "수집이 제대로 안 된 것"으로 간주한다.
 # 실제 관측치 기준: 정상 수집된 품목은 최소 54개월 이상, 수집 실패 품목은 3개월뿐이라
 # 12개월(1년)을 기준으로 삼으면 명확히 구분된다. 특정 품목명을 하드코딩하지 않기 위한 일반 규칙.
 MIN_HEALTHY_MONTHS = 12
+
+# 자동 코멘트/시그널보드 판단 기준 (퍼센트). "강함/약함"을 가르는 임계값이라 조정 가능하게 상수로 뺌.
+STRONG_YOY_PCT = 15.0
+WEAK_YOY_PCT = 0.0
+
+# 이 데이터는 bigfinance.co.kr의 "잠정 수출" 트래커(TRASS-BF)에서만 수집한다.
+# 별도의 "확정치" 소스가 없어 전량 잠정치로 취급한다 (특정 행만 확정으로 표시할 근거가 없음).
+DATA_SOURCE_LABEL = "BigFinance(bigfinance.co.kr) TRASS-BF 수출입 데이터"
+DATA_IS_PRELIMINARY = True
+# scrape_bigfinance.py를 등록한 Windows 작업 스케줄러 주기(10일)와 맞춘 값 - "다음 업데이트 예정" 추정에만 사용.
+SCRAPE_INTERVAL_DAYS = 10
 
 # 한/영 컬럼명 별칭 -> 표준 컬럼명
 COLUMN_ALIASES: dict[str, list[str]] = {
@@ -110,27 +123,56 @@ def load_history() -> tuple[pd.DataFrame, bool]:
 
 
 def compute_item_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """품목별로 정렬 후, 같은 (연,월) 기준으로 YoY/MoM을 다시 계산한다.
-    원본에 YoY/MoM 컬럼이 있어도 무시하고 date/export_amount로만 재계산한다.
-    전년동월/전월 데이터가 없으면 NaN."""
+    """품목별로 정렬 후, 같은 (연,월) 기준으로 아래 지표를 다시 계산한다.
+    원본에 YoY/MoM 컬럼이 있어도 무시하고 date/export_amount(+unit_price)로만 재계산한다.
+    필요한 시점 데이터가 없으면 전부 NaN.
+
+    - yoy/mom: 수출금액 YoY/MoM
+    - export_volume: 수출물량 추정치 = 수출금액 / 단가 (단가 컬럼이 있을 때만; 직접 제공되는
+      물량 컬럼이 없어 금액/단가로 역산한다 - 임의 추정이 아니라 두 실측값의 산술 변환)
+    - volume_yoy: 수출물량 YoY
+    - price_yoy: 수출단가 YoY
+    - ma3_amount: 수출금액 3개월 이동평균
+    - ma3_yoy: 3개월 이동평균 YoY
+    - ma3_yoy_prev: 직전월의 ma3_yoy (추세 개선/저점통과 판단용)
+    """
+    has_price = "unit_price" in df.columns
+
+    def _pct(by_period: dict, period, offset) -> float:
+        base = by_period.get(period - offset)
+        current = by_period.get(period)
+        if base is None or pd.isna(base) or base == 0 or current is None or pd.isna(current):
+            return np.nan
+        return (current - base) / base * 100
 
     def _per_item(g: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("date").copy()
         g["period"] = g["date"].dt.to_period("M")
-        amount_by_period = dict(zip(g["period"], g["export_amount"]))
 
-        def _pct_change(period, offset):
-            base = amount_by_period.get(period - offset)
-            if base is None or pd.isna(base) or base == 0:
-                return np.nan
-            current = amount_by_period[period]
-            if pd.isna(current):
-                return np.nan
-            return (current - base) / base * 100
+        if has_price:
+            g["export_volume"] = np.where(
+                g["unit_price"].notna() & (g["unit_price"] != 0),
+                g["export_amount"] / g["unit_price"],
+                np.nan,
+            )
+        else:
+            g["export_volume"] = np.nan
+        g["ma3_amount"] = g["export_amount"].rolling(3, min_periods=3).mean()
 
-        g["yoy"] = g["period"].apply(lambda p: _pct_change(p, 12))
-        g["mom"] = g["period"].apply(lambda p: _pct_change(p, 1))
-        g["prev_month_amount"] = g["period"].apply(lambda p: amount_by_period.get(p - 1))
+        amount_bp = dict(zip(g["period"], g["export_amount"]))
+        price_bp = dict(zip(g["period"], g["unit_price"])) if has_price else {}
+        volume_bp = dict(zip(g["period"], g["export_volume"]))
+        ma3_bp = dict(zip(g["period"], g["ma3_amount"]))
+
+        g["yoy"] = g["period"].apply(lambda p: _pct(amount_bp, p, 12))
+        g["mom"] = g["period"].apply(lambda p: _pct(amount_bp, p, 1))
+        g["prev_month_amount"] = g["period"].apply(lambda p: amount_bp.get(p - 1))
+        g["price_yoy"] = g["period"].apply(lambda p: _pct(price_bp, p, 12)) if has_price else np.nan
+        g["volume_yoy"] = g["period"].apply(lambda p: _pct(volume_bp, p, 12))
+        g["ma3_yoy"] = g["period"].apply(lambda p: _pct(ma3_bp, p, 12))
+
+        ma3_yoy_bp = dict(zip(g["period"], g["ma3_yoy"]))
+        g["ma3_yoy_prev"] = g["period"].apply(lambda p: ma3_yoy_bp.get(p - 1))
         return g
 
     parts = [_per_item(g) for _, g in df.groupby("item_name")]
@@ -147,14 +189,22 @@ def get_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
 def load_item_mapping(df: pd.DataFrame) -> pd.DataFrame:
     """config/item_mapping.csv를 로딩한다.
     - 파일이 없으면: 현재 데이터의 품목으로 새로 만든다 (category=품목명 첫 '_' 앞부분,
-      related_companies는 빈 값 - 실제 기업 매핑 정보가 없어 임의로 채우지 않는다).
+      related_companies/hs_code는 빈 값 - 실제 매핑 정보가 없어 임의로 채우지 않는다).
     - 파일이 있으면: 거기 없는 신규 품목만 추가하고, 기존 행은 절대 덮어쓰지 않는다.
+    - hs_code 컬럼이 옛 파일에 없으면(이전 버전에서 만든 파일) 빈 값으로 추가만 한다
+      (기존 item_name/category/related_companies 값은 그대로 유지).
     """
     MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
     current_items = sorted(df["item_name"].dropna().unique().tolist())
 
     if MAPPING_PATH.exists():
         mapping = pd.read_csv(MAPPING_PATH, dtype=str).fillna("")
+        changed = False
+        for col in MAPPING_COLUMNS:
+            if col not in mapping.columns:
+                mapping[col] = ""
+                changed = True
+
         existing_items = set(mapping["item_name"])
         new_items = [i for i in current_items if i not in existing_items]
         if new_items:
@@ -163,9 +213,14 @@ def load_item_mapping(df: pd.DataFrame) -> pd.DataFrame:
                     "item_name": new_items,
                     "category": [i.split("_")[0] for i in new_items],
                     "related_companies": ["" for _ in new_items],
+                    "hs_code": ["" for _ in new_items],
                 }
             )
             mapping = pd.concat([mapping, new_rows], ignore_index=True)
+            changed = True
+
+        if changed:
+            mapping = mapping[MAPPING_COLUMNS]
             mapping.to_csv(MAPPING_PATH, index=False)
         return mapping
 
@@ -174,6 +229,7 @@ def load_item_mapping(df: pd.DataFrame) -> pd.DataFrame:
             "item_name": current_items,
             "category": [i.split("_")[0] for i in current_items],
             "related_companies": ["" for _ in current_items],
+            "hs_code": ["" for _ in current_items],
         }
     )
     mapping.to_csv(MAPPING_PATH, index=False)
@@ -186,6 +242,16 @@ def get_related_companies(mapping: pd.DataFrame, item_name: str) -> list[str]:
         return []
     raw = str(row.iloc[0].get("related_companies", "") or "")
     return [c.strip() for c in re.split(r"[;,]", raw) if c.strip()]
+
+
+def get_hs_code(mapping: pd.DataFrame, item_name: str) -> str:
+    """HS 코드 매핑은 아직 정리되지 않아 대부분 빈 값이다. 임의로 채우지 않는다."""
+    if "hs_code" not in mapping.columns:
+        return ""
+    row = mapping[mapping["item_name"] == item_name]
+    if row.empty:
+        return ""
+    return str(row.iloc[0].get("hs_code", "") or "").strip()
 
 
 def get_categories(mapping: pd.DataFrame, df: pd.DataFrame) -> list[str]:
@@ -213,6 +279,125 @@ def get_missing_items(df: pd.DataFrame, mapping: pd.DataFrame) -> list[dict]:
         if n < MIN_HEALTHY_MONTHS:
             issues.append({"item_name": item, "reason": f"히스토리 {n}개월뿐 (수집 실패 의심)"})
     return issues
+
+
+# ---------- 데이터 기준 정보 (모든 화면 상단에 고정 표시) ----------
+def get_data_status(df: pd.DataFrame, missing_items: list[dict]) -> dict:
+    """데이터 기준월/잠정치 여부/마지막 업데이트 시각/출처/다음 업데이트 예정일을 계산.
+    '마지막 업데이트'는 별도 로그가 없어 trade_history_long.csv의 실제 파일 수정 시각을 쓴다
+    (파일이 실제로 언제 갱신됐는지를 그대로 반영하는 값이라 임의 추정이 아니다).
+    '다음 업데이트 예정'은 작업 스케줄러 주기(10일)를 더한 추정치일 뿐, 확정 일정이 아니다."""
+    latest_period = df["date"].max().to_period("M")
+    last_updated = datetime.fromtimestamp(HISTORY_PATH.stat().st_mtime) if HISTORY_PATH.exists() else None
+    next_update_estimate = (last_updated + timedelta(days=SCRAPE_INTERVAL_DAYS)) if last_updated else None
+    return {
+        "latest_period": str(latest_period),
+        "is_preliminary": DATA_IS_PRELIMINARY,
+        "last_updated": last_updated,
+        "source_label": DATA_SOURCE_LABEL,
+        "next_update_estimate": next_update_estimate,
+        "missing_count": len(missing_items),
+    }
+
+
+# ---------- Top N / 자동 코멘트 ----------
+def get_top_n(latest_df: pd.DataFrame, col: str, n: int = 10, ascending: bool = False) -> pd.DataFrame:
+    """latest_df(품목별 최신 시점)를 col 기준으로 정렬해 상위 n개를 반환. NaN은 항상 제외."""
+    valid = latest_df[latest_df[col].notna()]
+    return valid.sort_values(col, ascending=ascending).head(n)
+
+
+def _fmt_signed(v: float) -> str:
+    return f"{v:+.1f}%" if pd.notna(v) else "N/A"
+
+
+def generate_comment(row: pd.Series) -> str:
+    """규칙 기반 자동 코멘트. row는 compute_item_metrics() 결과의 한 행(보통 최신 시점)이어야 한다.
+    yoy/ma3_yoy/price_yoy/volume_yoy가 없으면(NaN) 해당 판단은 건너뛰고 보수적으로 서술한다."""
+    yoy = row.get("yoy")
+    ma3_yoy = row.get("ma3_yoy")
+    ma3_yoy_prev = row.get("ma3_yoy_prev")
+    price_yoy = row.get("price_yoy")
+    volume_yoy = row.get("volume_yoy")
+
+    if pd.isna(yoy):
+        return "최근월 수출금액 YoY를 계산할 전년동월 데이터가 없어 판단을 보류합니다."
+
+    if pd.notna(ma3_yoy) and yoy >= STRONG_YOY_PCT and ma3_yoy < WEAK_YOY_PCT:
+        headline = (
+            f"최근월 수출금액은 YoY {_fmt_signed(yoy)}로 급증했지만, 3개월 이동평균 기준으로는 "
+            f"YoY {_fmt_signed(ma3_yoy)}에 그쳐 일시적 급증 가능성이 있습니다. 지속성 확인이 필요합니다."
+        )
+    elif pd.notna(ma3_yoy) and yoy >= STRONG_YOY_PCT and ma3_yoy >= STRONG_YOY_PCT:
+        headline = (
+            f"최근월 수출금액은 YoY {_fmt_signed(yoy)} 증가했고, 3개월 이동평균 기준으로도 "
+            f"YoY {_fmt_signed(ma3_yoy)}를 기록해 추세 개선이 확인됩니다."
+        )
+    elif (
+        yoy < WEAK_YOY_PCT
+        and pd.notna(ma3_yoy)
+        and pd.notna(ma3_yoy_prev)
+        and ma3_yoy > ma3_yoy_prev
+        and ma3_yoy >= WEAK_YOY_PCT
+    ):
+        headline = (
+            f"최근월 수출금액은 YoY {_fmt_signed(yoy)}로 약하지만, 3개월 이동평균 YoY가 "
+            f"{_fmt_signed(ma3_yoy_prev)}에서 {_fmt_signed(ma3_yoy)}로 개선되고 있어 저점 통과 가능성이 있습니다."
+        )
+    elif (
+        yoy < WEAK_YOY_PCT
+        and pd.notna(price_yoy)
+        and pd.notna(volume_yoy)
+        and price_yoy < WEAK_YOY_PCT
+        and volume_yoy < WEAK_YOY_PCT
+    ):
+        headline = (
+            f"최근월 수출금액은 YoY {_fmt_signed(yoy)}이고 수출단가(YoY {_fmt_signed(price_yoy)})와 "
+            f"수출물량(YoY {_fmt_signed(volume_yoy)}) 모두 둔화되어 업황 둔화 가능성이 있습니다."
+        )
+    else:
+        headline = f"최근월 수출금액은 YoY {_fmt_signed(yoy)}를 기록했습니다."
+
+    decomposition = ""
+    if pd.notna(price_yoy):
+        if yoy >= STRONG_YOY_PCT and price_yoy < WEAK_YOY_PCT:
+            decomposition = (
+                f" 수출단가는 YoY {_fmt_signed(price_yoy)}로 하락해 물량 중심의 성장으로 보이며, "
+                "기업 실적 추정 시 마진 개선 여부는 추가 확인이 필요합니다."
+            )
+        elif yoy >= STRONG_YOY_PCT and price_yoy >= STRONG_YOY_PCT:
+            decomposition = (
+                f" 수출단가도 YoY {_fmt_signed(price_yoy)} 상승해 단순 물량 증가뿐 아니라 "
+                "ASP 또는 믹스 개선 가능성이 있습니다."
+            )
+        elif price_yoy >= STRONG_YOY_PCT:
+            decomposition = f" 수출단가가 YoY {_fmt_signed(price_yoy)} 상승 중이어서 ASP 상승 흐름을 주시할 필요가 있습니다."
+        elif price_yoy < WEAK_YOY_PCT:
+            decomposition = f" 수출단가는 YoY {_fmt_signed(price_yoy)}로 하락세입니다."
+
+    return (headline + decomposition).strip()
+
+
+def build_pm_summary(latest_df: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
+    """PM Summary 다운로드용 요약 테이블. 기업/섹터/컨센서스 등은 매핑 데이터가 정리되면 추가."""
+    rows = []
+    for _, r in latest_df.iterrows():
+        rows.append(
+            {
+                "기준월": str(r["period"]),
+                "품목명": r["item_name"],
+                "HS코드": get_hs_code(mapping, r["item_name"]),
+                "최근월_수출금액": r["export_amount"],
+                "수출금액_MoM(%)": r["mom"],
+                "수출금액_YoY(%)": r["yoy"],
+                "3개월이동평균_YoY(%)": r["ma3_yoy"],
+                "수출단가_YoY(%)": r["price_yoy"],
+                "수출물량_YoY(%)": r["volume_yoy"],
+                "잠정확정여부": "잠정치" if DATA_IS_PRELIMINARY else "확정치",
+                "자동코멘트": generate_comment(r),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ---------- favorites (로컬 전용 - Streamlit Cloud 등에 배포 시 파일시스템이 초기화되어 유지 안 됨) ----------
