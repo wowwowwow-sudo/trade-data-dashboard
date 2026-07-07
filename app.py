@@ -434,10 +434,16 @@ def render_detail(item_name: str) -> None:
     hs = get_hs_code(mapping_df, item_name)
     companies = get_related_companies(mapping_df, item_name)
     st.subheader(item_name)
-    meta = [f"HS코드: {hs or '미매핑'}"]
+    meta_lines = [f'<div><span style="font-weight:600;">HS코드:</span> {hs or "미매핑"}</div>']
     if companies:
-        meta.append("관련 기업: " + ", ".join(companies))
-    st.caption(" | ".join(meta))
+        meta_lines.append(
+            f'<div><span style="font-weight:600;">관련 기업:</span> {", ".join(companies)}</div>'
+        )
+    st.markdown(
+        f'<div style="color:{TEXT_MAIN};font-size:13.5px;line-height:1.7;margin:4px 0 10px;">'
+        + "".join(meta_lines) + '</div>',
+        unsafe_allow_html=True,
+    )
 
     # 1. 핵심 요약 박스
     st.markdown("##### 1. 핵심 요약")
