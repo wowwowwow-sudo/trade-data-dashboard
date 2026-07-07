@@ -320,6 +320,44 @@ def get_company_history(company_metrics_df: pd.DataFrame, item_name: str, compan
     return view.sort_values("date").reset_index(drop=True)
 
 
+def get_company_latest_snapshot(company_metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """(품목, 기업) 조합별 최신 시점 1행만 추출 - 기업 검색 결과 카드용."""
+    if company_metrics_df.empty:
+        return company_metrics_df
+    latest = company_metrics_df.sort_values("date").groupby(["item_name", "company_name"], as_index=False).tail(1)
+    return latest.reset_index(drop=True)
+
+
+def search_company_data(company_metrics_df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """company_trade_history_long.csv 기반 실제 수출 데이터에서 기업명을 검색한다
+    (부분일치, 대소문자 무시). 결과가 없으면 빈 DataFrame - 호출부가 "실제 데이터 없음"으로
+    처리해야 한다."""
+    latest = get_company_latest_snapshot(company_metrics_df)
+    if latest.empty or not query.strip():
+        return latest.iloc[0:0]
+    q = query.strip().lower()
+    return latest[latest["company_name"].str.lower().str.contains(q, na=False, regex=False)].reset_index(drop=True)
+
+
+def search_related_company_items(mapping_df: pd.DataFrame, query: str) -> list[dict]:
+    """item_mapping.csv의 related_companies(참고용 텍스트, 실제 수출 데이터 아님)에서
+    검색어를 포함하는 기업이 언급된 품목 목록을 반환한다. HS코드 매핑 137개 품목 전체가
+    대상이라 search_company_data보다 훨씬 폭넓게 매칭될 수 있다."""
+    if not query.strip() or mapping_df.empty:
+        return []
+    q = query.strip().lower()
+    results = []
+    for _, row in mapping_df.iterrows():
+        raw = str(row.get("related_companies", "") or "")
+        companies = [c.strip() for c in re.split(r"[;,]", raw) if c.strip()]
+        matched = [c for c in companies if q in c.lower()]
+        if matched:
+            results.append(
+                {"item_name": row["item_name"], "category": row.get("category", ""), "matched_companies": matched}
+            )
+    return results
+
+
 # ---------- item_mapping.csv ----------
 def load_item_mapping(df: pd.DataFrame) -> pd.DataFrame:
     """config/item_mapping.csv를 로딩한다.

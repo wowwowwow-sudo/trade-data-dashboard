@@ -38,6 +38,8 @@ from utils_data import (
     load_favorites,
     load_history,
     load_item_mapping,
+    search_company_data,
+    search_related_company_items,
     toggle_favorite,
 )
 
@@ -413,6 +415,45 @@ def render_watchlist() -> None:
     st.caption("추후 기업별 매핑이 정리되면 관련 기업, 컨센서스 대비 괴리, 데이터 신뢰도 컬럼을 추가할 예정입니다.")
 
 
+# ---------- 기업 검색 (실제 수출 데이터 + 관련 종목 참고 텍스트) ----------
+def render_company_search() -> None:
+    st.subheader("🏢 기업 검색")
+    query = st.text_input(
+        "기업명 검색...", label_visibility="collapsed", placeholder="기업명을 입력하세요 (예: 삼성전기)"
+    )
+    if not query:
+        st.caption(
+            "기업명을 입력하면 실제 수출 데이터(품목 및 지역 커스텀 설정에 등록된 기업)와, "
+            "관련 종목으로만 참고 표시된 품목을 함께 보여줍니다."
+        )
+        return
+
+    company_metrics_df = _load_company_with_metrics()
+    data_matches = search_company_data(company_metrics_df, query)
+    related_matches = search_related_company_items(mapping_df, query)
+
+    if not data_matches.empty:
+        st.markdown(f"##### 실제 수출 데이터 있음 ({len(data_matches)}건)")
+        data_matches = data_matches.sort_values("export_amount", ascending=False).reset_index(drop=True)
+        cols = st.columns(CARD_COLS)
+        for i, (_, row) in enumerate(data_matches.iterrows()):
+            with cols[i % CARD_COLS]:
+                st.caption(row["item_name"])
+                render_company_card(row, row["item_name"], company_metrics_df)
+    else:
+        st.caption("실제 수출 데이터(기업별 커스텀 설정)는 없습니다.")
+
+    if related_matches:
+        st.markdown(f"##### 관련 종목으로 언급된 품목 ({len(related_matches)}건 · 참고용, 실제 수출 데이터 아님)")
+        for r in related_matches:
+            matched_str = ", ".join(r["matched_companies"])
+            if st.button(f"{r['item_name']} — {matched_str}", key=f"related_item_{r['item_name']}"):
+                st.session_state.selected_item = r["item_name"]
+                st.rerun()
+    elif data_matches.empty:
+        st.info("검색 결과가 없습니다.")
+
+
 # ---------- 전체 품목 (검색/필터/카드+테이블) ----------
 def _related_companies_str(item_name: str) -> str:
     return " ".join(get_related_companies(mapping_df, item_name))
@@ -709,7 +750,12 @@ def render_company_detail(item_name: str, company_name: str) -> None:
 with st.sidebar:
     st.markdown(f"##### 수출입 데이터")
 
-    nav_options = [("board", "📊 투자 시그널"), ("watchlist", "⭐ Watchlist"), ("all", "📋 전체 품목")]
+    nav_options = [
+        ("board", "📊 투자 시그널"),
+        ("watchlist", "⭐ Watchlist"),
+        ("all", "📋 전체 품목"),
+        ("company_search", "🏢 기업 검색"),
+    ]
     for key, label in nav_options:
         is_active = (
             st.session_state.view == key
@@ -763,5 +809,7 @@ elif st.session_state.view == "watchlist":
     render_watchlist()
 elif st.session_state.view == "all":
     render_all_items()
+elif st.session_state.view == "company_search":
+    render_company_search()
 else:
     render_board()
