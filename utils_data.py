@@ -18,9 +18,23 @@ import pandas as pd
 
 BASE_DIR = Path(__file__).parent
 HISTORY_PATH = BASE_DIR / "trade_history_long.csv"
+COMPANY_HISTORY_PATH = BASE_DIR / "company_trade_history_long.csv"
 MAPPING_PATH = BASE_DIR / "config" / "item_mapping.csv"
 FAVORITES_PATH = BASE_DIR / "favorites.json"
 MAPPING_COLUMNS = ["item_name", "category", "related_companies", "hs_code"]
+
+# company_trade_history_long.csv 컬럼 별칭. item_mapping.csv의 related_companies(참고용
+# 텍스트, HS코드 매핑 137개 품목 전체)와는 다른 데이터다 - 이건 EPIC Finance "품목 및
+# 지역 커스텀 설정"에서 하위 기업(지역) 행이 실제로 설정된 일부 품목에만 존재하는
+# 실측 수출 데이터다 (scrape_bigfinance.py의 scrape_company_breakdowns() 참고).
+COMPANY_COLUMN_ALIASES: dict[str, list[str]] = {
+    "item_name": ["품목명", "item_name"],
+    "company_name": ["기업명", "company_name"],
+    "date": ["기준일", "date"],
+    "export_amount": ["수출금액", "export_amount"],
+    "unit_price": ["수출단가", "단가", "unit_price"],
+}
+COMPANY_REQUIRED_COLUMNS = ["item_name", "company_name", "date", "export_amount"]
 
 # 최소 이 개월수 미만의 데이터만 있는 품목은 "수집이 제대로 안 된 것"으로 간주한다.
 # 실제 관측치 기준: 정상 수집된 품목은 최소 54개월 이상, 수집 실패 품목은 3개월뿐이라
@@ -183,6 +197,127 @@ def get_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
     """품목별 최신 시점 1행만 추출 (카드/요약용)."""
     latest = df_with_metrics.sort_values("date").groupby("item_name", as_index=False).tail(1)
     return latest.reset_index(drop=True)
+
+
+# ---------- company_trade_history_long.csv (기업별 수출 - 일부 품목만 존재) ----------
+_COMPANY_EMPTY_COLUMNS = ["item_name", "company_name", "date", "export_amount", "unit_price"]
+
+
+def load_company_history() -> pd.DataFrame:
+    """company_trade_history_long.csv를 로딩/정규화한다.
+
+    EPIC Finance "품목 및 지역 커스텀 설정"에서 하위 기업(지역) 행이 실제로 설정된
+    품목만 데이터가 존재한다 - 137개 품목 중 일부뿐이다. 파일이 없거나 비어 있어도
+    에러가 아니라 "이 자산운용사가 아직 기업별 커스텀 설정을 하지 않았다"는 정상
+    상태이므로, load_history()와 달리 DataLoadError를 던지지 않고 조용히 빈
+    DataFrame을 반환한다 (호출부가 품목별 기업 카드 섹션을 그냥 숨기면 된다).
+    """
+    empty = pd.DataFrame(columns=_COMPANY_EMPTY_COLUMNS)
+    if not COMPANY_HISTORY_PATH.exists():
+        return empty
+    try:
+        raw = pd.read_csv(COMPANY_HISTORY_PATH)
+    except Exception:
+        return empty
+    if raw.empty:
+        return empty
+
+    rename_map = {}
+    for canonical, aliases in COMPANY_COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in raw.columns and canonical not in rename_map.values():
+                rename_map[alias] = canonical
+                break
+    df = raw.rename(columns=rename_map)
+
+    if any(c not in df.columns for c in COMPANY_REQUIRED_COLUMNS):
+        return empty
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["export_amount"] = clean_numeric(df["export_amount"])
+    if "unit_price" in df.columns:
+        df["unit_price"] = clean_numeric(df["unit_price"])
+    df = df.dropna(subset=["date", "item_name", "company_name"]).copy()
+    df = df.sort_values(["item_name", "company_name", "date"]).reset_index(drop=True)
+    return df
+
+
+def compute_company_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """(품목, 기업) 조합별로 정렬 후 YoY/MoM 등을 계산한다.
+    compute_item_metrics와 동일한 계산식이지만 item_name 단독이 아니라
+    (item_name, company_name) 조합 단위로 그룹핑한다."""
+    if df.empty:
+        return df.assign(
+            period=pd.Series(dtype="object"),
+            export_volume=pd.Series(dtype="float64"),
+            ma3_amount=pd.Series(dtype="float64"),
+            yoy=pd.Series(dtype="float64"),
+            mom=pd.Series(dtype="float64"),
+            price_yoy=pd.Series(dtype="float64"),
+            volume_yoy=pd.Series(dtype="float64"),
+            ma3_yoy=pd.Series(dtype="float64"),
+        )
+
+    has_price = "unit_price" in df.columns
+
+    def _pct(by_period: dict, period, offset) -> float:
+        base = by_period.get(period - offset)
+        current = by_period.get(period)
+        if base is None or pd.isna(base) or base == 0 or current is None or pd.isna(current):
+            return np.nan
+        return (current - base) / base * 100
+
+    def _per_group(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values("date").copy()
+        g["period"] = g["date"].dt.to_period("M")
+
+        if has_price:
+            g["export_volume"] = np.where(
+                g["unit_price"].notna() & (g["unit_price"] != 0),
+                g["export_amount"] / g["unit_price"],
+                np.nan,
+            )
+        else:
+            g["export_volume"] = np.nan
+        g["ma3_amount"] = g["export_amount"].rolling(3, min_periods=3).mean()
+
+        amount_bp = dict(zip(g["period"], g["export_amount"]))
+        price_bp = dict(zip(g["period"], g["unit_price"])) if has_price else {}
+        volume_bp = dict(zip(g["period"], g["export_volume"]))
+        ma3_bp = dict(zip(g["period"], g["ma3_amount"]))
+
+        g["yoy"] = g["period"].apply(lambda p: _pct(amount_bp, p, 12))
+        g["mom"] = g["period"].apply(lambda p: _pct(amount_bp, p, 1))
+        g["price_yoy"] = g["period"].apply(lambda p: _pct(price_bp, p, 12)) if has_price else np.nan
+        g["volume_yoy"] = g["period"].apply(lambda p: _pct(volume_bp, p, 12))
+        g["ma3_yoy"] = g["period"].apply(lambda p: _pct(ma3_bp, p, 12))
+        return g
+
+    parts = [_per_group(g) for _, g in df.groupby(["item_name", "company_name"])]
+    return pd.concat(parts, ignore_index=True)
+
+
+def get_company_breakdown(company_metrics_df: pd.DataFrame, item_name: str) -> pd.DataFrame:
+    """특정 품목의 기업별 최신 시점 데이터(카드 섹션용)만 반환.
+    하위 기업 데이터가 없는 품목이면 빈 DataFrame - 호출부는 이 경우 카드 섹션
+    자체를 렌더링하지 않아야 한다."""
+    if company_metrics_df.empty:
+        return company_metrics_df
+    item_view = company_metrics_df[company_metrics_df["item_name"] == item_name]
+    if item_view.empty:
+        return item_view
+    latest = item_view.sort_values("date").groupby("company_name", as_index=False).tail(1)
+    return latest.reset_index(drop=True)
+
+
+def get_company_history(company_metrics_df: pd.DataFrame, item_name: str, company_name: str) -> pd.DataFrame:
+    """기업 상세 화면용 - 해당 품목x기업의 전체 월별 시계열."""
+    if company_metrics_df.empty:
+        return company_metrics_df
+    view = company_metrics_df[
+        (company_metrics_df["item_name"] == item_name) & (company_metrics_df["company_name"] == company_name)
+    ]
+    return view.sort_values("date").reset_index(drop=True)
 
 
 # ---------- item_mapping.csv ----------
