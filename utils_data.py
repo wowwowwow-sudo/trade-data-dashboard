@@ -570,6 +570,19 @@ TAG_PRICE_DRIVEN = "단가 주도"
 TAG_VOLUME_DRIVEN = "물량 주도"
 TAG_NONE = "–"
 
+# 화면에 태그 범례로 그대로 노출하는 설명 - _classify_tag()의 실제 판정 순서/조건과
+# 반드시 같은 순서로 유지한다 (표시용 텍스트일 뿐 판정 로직은 아님).
+TAG_DESCRIPTIONS: dict[str, str] = {
+    TAG_NEGATIVE_TURN: "YoY 또는 MoM이 마이너스로 전환된 품목 (주의 필요)",
+    TAG_NOISE: "최근월 수출액이 하위 20% 수준으로 작은데 YoY가 100%를 넘어 통계적 착시일 수 있는 품목",
+    TAG_CHECK_NEEDED: "단가 YoY와 물량 YoY의 방향이 서로 엇갈려 원인 확인이 필요한 품목",
+    TAG_SHORT_SPIKE: "이번 달 MoM은 크게 뛰었지만 3개월 평균 YoY로는 아직 추세로 확인되지 않은 품목",
+    TAG_TREND_IMPROVING: "YoY·3개월 평균 YoY·MoM이 모두 플러스로, 추세 개선이 뚜렷한 품목",
+    TAG_PRICE_DRIVEN: "수출 증가가 물량보다 단가(ASP) 상승에서 주로 비롯된 품목",
+    TAG_VOLUME_DRIVEN: "수출 증가가 단가보다 물량 증가에서 주로 비롯된 품목",
+    TAG_NONE: "위 조건에 뚜렷하게 해당하지 않는 품목",
+}
+
 
 def _percentile_rank(series: pd.Series) -> pd.Series:
     """0~100 백분위 순위. 극단치(YoY +5000% 등)가 점수를 왜곡하지 않도록 raw 값 대신

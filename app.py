@@ -21,7 +21,9 @@ import streamlit as st
 
 from utils_data import (
     BASE_DIR,
+    SIGNAL_SCORE_WEIGHTS,
     STRONG_YOY_PCT,
+    TAG_DESCRIPTIONS,
     TAG_NEGATIVE_TURN,
     DataLoadError,
     build_pm_summary,
@@ -581,19 +583,34 @@ def _signal_top10_display_df(top10: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "순위": range(1, len(top10) + 1),
+            "Signal Score": top10["signal_score"].values,
+            "해석 태그": top10["tag"].values,
             "품목": top10["item_name"].values,
             "섹터": top10["category"].values,
+            "관련 기업": [_related_companies_str(n) or "–" for n in top10["item_name"]],
             "최근월 수출액": [_fmt_amount_abbr(v) for v in top10["export_amount"]],
             "YoY": [_fmt_pct_text(v) for v in top10["yoy"]],
             "MoM": [_fmt_pct_text(v) for v in top10["mom"]],
             "3M YoY": [_fmt_pct_text(v) for v in top10["ma3_yoy"]],
             "단가 YoY": [_fmt_pct_text(v) for v in top10["price_yoy"]],
             "물량 YoY": [_fmt_pct_text(v) for v in top10["volume_yoy"]],
-            "관련 기업": [_related_companies_str(n) or "–" for n in top10["item_name"]],
-            "Signal Score": top10["signal_score"].values,
-            "해석 태그": top10["tag"].values,
         }
     )
+
+
+def render_signal_score_legend() -> None:
+    """Signal Score 계산식/해석 태그 의미를 실제 코드의 가중치·설명과 동일하게 보여준다
+    (하드코딩된 별도 문구가 아니라 utils_data.py의 SIGNAL_SCORE_WEIGHTS/TAG_DESCRIPTIONS를
+    그대로 사용 - 로직이 바뀌면 이 설명도 자동으로 같이 바뀐다)."""
+    with st.expander("Signal Score / 해석 태그 기준 보기"):
+        weight_label = {"yoy": "YoY", "mom": "MoM", "ma3_yoy": "3M YoY", "price_yoy": "단가 YoY"}
+        formula = " + ".join(f"{w:.0%}×{weight_label[k]} 순위" for k, w in SIGNAL_SCORE_WEIGHTS.items())
+        st.markdown(
+            f"**Signal Score** = {formula} (각 지표를 전체 품목 중 순위로 환산해 0~100점, 결측은 중립값 50으로 대체)"
+        )
+        st.markdown("**해석 태그** (아래 순서대로 먼저 맞는 조건 하나만 표시)")
+        for tag, desc in TAG_DESCRIPTIONS.items():
+            st.markdown(f"- **{tag}**: {desc}")
 
 
 def _pct_text_color(val) -> str:
@@ -607,6 +624,7 @@ def _pct_text_color(val) -> str:
 
 def render_signal_top10_table(enriched_df: pd.DataFrame) -> None:
     st.markdown("###### 오늘의 투자 시그널 Top 10 (Signal Score 기준)")
+    render_signal_score_legend()
     top10 = enriched_df.sort_values("signal_score", ascending=False).head(10).reset_index(drop=True)
     if top10.empty:
         st.caption("계산 가능한 데이터가 없습니다.")
