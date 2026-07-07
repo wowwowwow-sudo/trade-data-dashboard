@@ -21,11 +21,16 @@ import streamlit as st
 
 from utils_data import (
     BASE_DIR,
+    STRONG_YOY_PCT,
+    TAG_NEGATIVE_TURN,
     DataLoadError,
     build_pm_summary,
+    build_related_company_table,
+    classify_alert_reason,
     compute_company_metrics,
     compute_item_metrics,
-    generate_comment,
+    enrich_signal_board,
+    generate_detail_commentary,
     get_categories,
     get_company_breakdown,
     get_company_history,
@@ -45,18 +50,24 @@ from utils_data import (
 
 st.set_page_config(page_title="수출입 데이터 — 투자 시그널 보드", layout="wide")
 
-# ---------- 팔레트 (라이트 테마) ----------
+# ---------- 팔레트 (디자인 토큰 - Phase 0에서 확정, 기관 리서치 톤) ----------
+BG_MAIN = "#F8FAFC"
 CARD_BG = "#FFFFFF"
 CARD_BORDER = "#E5E7EB"
-TEXT_MAIN = "#111827"
-TEXT_SECONDARY = "#6B7280"
-POSITIVE = "#10B981"
-NEGATIVE = "#EF4444"
+TEXT_MAIN = "#0F172A"
+TEXT_SECONDARY = "#64748B"
 ACCENT = "#2563EB"
+ACCENT_DARK = "#1D4ED8"
+# 한국 시장 관례: 상승/긍정 = 빨강, 하락/부정 = 파랑 (미국식 초록/빨강과 반대)
+POSITIVE = "#DC2626"
+NEGATIVE = "#2563EB"
 WARNING = "#F59E0B"
 PRICE_COLOR = "#2563EB"
 VOLUME_COLOR = "#7C3AED"
 BADGE_BG = "#F3F4F6"
+ACTIVE_BG = "#EFF6FF"
+ACTIVE_TEXT = "#1D4ED8"
+ACTIVE_BORDER = "#2563EB"
 PLOTLY_TEMPLATE = "plotly_white"
 
 SCRAPER_PATH = BASE_DIR / "scrape_bigfinance.py"
@@ -67,6 +78,10 @@ CARD_COLS = 4
 st.markdown(
     f"""
     <style>
+    /* ===== 전역 톤 ===== */
+    .stApp {{ background: {BG_MAIN}; }}
+
+    /* ===== 카드 (보드/전체품목/품목상세/기업상세 공용) ===== */
     .signal-card {{
         background: {CARD_BG};
         border: 1px solid {CARD_BORDER};
@@ -77,10 +92,10 @@ st.markdown(
     }}
     .rank-badge {{
         font-weight: 700; color: {ACCENT}; font-size: 11.5px;
-        background: #EFF4FF; padding: 2px 8px; border-radius: 999px;
+        background: {ACTIVE_BG}; padding: 2px 8px; border-radius: 999px;
     }}
     .mapping-badge {{
-        font-size: 10px; color: #9CA3AF; background: {BADGE_BG};
+        font-size: 10px; color: {TEXT_SECONDARY}; background: {BADGE_BG};
         padding: 1px 7px; border-radius: 999px; margin-left: 6px;
     }}
     .signal-card-title {{ font-weight: 700; font-size: 14.5px; color: {TEXT_MAIN}; margin-top: 6px; }}
@@ -88,8 +103,29 @@ st.markdown(
     .signal-card-amount {{ font-size: 19px; font-weight: 700; color: {TEXT_MAIN}; margin-top: 8px; }}
     .signal-card-metrics {{ display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 8px; font-size: 11px; }}
     .signal-card-metrics .m-label {{ color: {TEXT_SECONDARY}; margin-right: 3px; }}
-    .signal-card-meta {{ font-size: 10.5px; color: #9CA3AF; margin-top: 8px; }}
+    .signal-card-meta {{ font-size: 10.5px; color: {TEXT_SECONDARY}; margin-top: 8px; }}
 
+    /* ===== KPI 요약 카드 (투자 시그널 보드 최상단) ===== */
+    .kpi-card {{
+        background: {CARD_BG};
+        border: 1px solid {CARD_BORDER};
+        border-radius: 10px;
+        padding: 14px 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }}
+    .kpi-card-value {{ font-size: 24px; font-weight: 700; color: {TEXT_MAIN}; }}
+    .kpi-card-label {{ font-size: 11.5px; color: {TEXT_SECONDARY}; margin-top: 4px; }}
+    .kpi-card-value--sm {{ font-size: 17px; font-weight: 700; }}
+
+    /* ===== 전체 품목 - 카테고리 필터 (작은 pill/chip) ===== */
+    div[class*="st-key-category_filter_row"] .stButton button {{
+        border-radius: 999px;
+        padding: 2px 14px;
+        font-size: 12px;
+        min-height: 1.8em;
+    }}
+
+    /* ===== 카드 내부 버튼 (즐겨찾기/상세보기 링크형) ===== */
     div[class*="st-key-fav_"] button, div[class*="st-key-link_"] button {{
         background: transparent !important;
         border: none !important;
@@ -106,6 +142,46 @@ st.markdown(
     div[class*="st-key-fav_"] button {{
         font-size: 15px !important;
         float: right;
+    }}
+
+    /* ===== 사이드바 슬림화 + 네비게이션 (전체 품목의 카테고리 필터 버튼과
+       겹치지 않도록 section[data-testid="stSidebar"] 범위로만 한정) ===== */
+    section[data-testid="stSidebar"] {{
+        min-width: 235px !important;
+        max-width: 235px !important;
+    }}
+    section[data-testid="stSidebar"] .stButton button {{
+        min-height: 2.1em;
+        padding: 4px 12px;
+        font-size: 13px;
+        border-radius: 6px;
+        text-align: left;
+        justify-content: flex-start;
+    }}
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {{
+        gap: 0.35rem;
+    }}
+    section[data-testid="stSidebar"] button[kind="secondary"] {{
+        background: transparent;
+        border: 1px solid transparent;
+        color: {TEXT_MAIN};
+    }}
+    section[data-testid="stSidebar"] button[kind="secondary"]:hover {{
+        background: {BADGE_BG};
+        color: {TEXT_MAIN};
+        border-color: {BADGE_BG};
+    }}
+    section[data-testid="stSidebar"] button[kind="primary"] {{
+        background: {ACTIVE_BG} !important;
+        color: {ACTIVE_TEXT} !important;
+        border: 1px solid {ACTIVE_BG} !important;
+        border-left: 3px solid {ACTIVE_BORDER} !important;
+        font-weight: 600;
+        box-shadow: none !important;
+    }}
+    section[data-testid="stSidebar"] button[kind="primary"]:hover {{
+        background: {ACTIVE_BG} !important;
+        color: {ACTIVE_TEXT} !important;
     }}
     </style>
     """,
@@ -174,6 +250,7 @@ except DataLoadError as e:
 
 mapping_df = load_item_mapping(history_df)
 latest_df = metrics_df.sort_values("date").groupby("item_name", as_index=False).tail(1)
+enriched_df = enrich_signal_board(latest_df)  # Signal Score/해석 태그 - 투자 시그널 보드와 전체 품목 화면이 공유
 missing_items = get_missing_items(history_df, mapping_df)
 data_status = get_data_status(history_df, missing_items)
 
@@ -189,9 +266,19 @@ if "page_size" not in st.session_state:
     st.session_state.page_size = PAGE_SIZE_STEP
 if "selected_category" not in st.session_state:
     st.session_state.selected_category = "전체"
+if "selected_kpi" not in st.session_state:
+    st.session_state.selected_kpi = None
+if "chart_period" not in st.session_state:
+    st.session_state.chart_period = "5Y"
+if "items_view_mode" not in st.session_state:
+    st.session_state.items_view_mode = "테이블형"
 
 
 # ---------- 상태바 (모든 화면 상단 고정) ----------
+def _status_item(text: str, color: str = TEXT_SECONDARY) -> str:
+    return f'<span style="color:{color};">{text}</span>'
+
+
 def render_status_bar() -> None:
     last_updated = (
         data_status["last_updated"].strftime("%Y-%m-%d %H:%M") if data_status["last_updated"] else "알 수 없음"
@@ -201,20 +288,25 @@ def render_status_bar() -> None:
     )
     prelim_txt = "잠정치" if data_status["is_preliminary"] else "확정치"
     if data_status["missing_count"]:
-        missing_txt = f"⚠ 누락/수집실패 의심 {data_status['missing_count']}개 품목"
+        missing_txt = f"누락/수집실패 의심 {data_status['missing_count']}개 품목"
         missing_color = WARNING
     else:
         missing_txt = "누락 없음"
         missing_color = TEXT_SECONDARY
+
+    items = [
+        _status_item(f'데이터 기준: <b style="color:{TEXT_MAIN};">{data_status["latest_period"]}</b> {prelim_txt}'),
+        _status_item(f"마지막 업데이트: {last_updated}"),
+        _status_item(f"출처: {data_status['source_label']}"),
+        _status_item(missing_txt, missing_color),
+        _status_item(f"다음 업데이트 예정: {next_update}"),
+    ]
+    separator = f'<span style="color:{CARD_BORDER};">|</span>'
     st.markdown(
         f"""
-        <div style="background:{CARD_BG};border:1px solid {CARD_BORDER};border-radius:8px;padding:9px 18px;
-        margin-bottom:14px;font-size:12.5px;color:{TEXT_SECONDARY};display:flex;flex-wrap:wrap;gap:6px 22px;align-items:center;">
-          <span style="color:{TEXT_MAIN};">데이터 기준: <b>{data_status['latest_period']}</b> {prelim_txt}</span>
-          <span>마지막 업데이트: {last_updated}</span>
-          <span>출처: {data_status['source_label']}</span>
-          <span style="color:{missing_color};">{missing_txt}</span>
-          <span>다음 업데이트 예정: {next_update}</span>
+        <div style="background:{CARD_BG};border:1px solid {CARD_BORDER};border-radius:6px;padding:6px 14px;
+        margin-bottom:12px;font-size:12px;color:{TEXT_SECONDARY};display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;">
+          {f" {separator} ".join(items)}
         </div>
         """,
         unsafe_allow_html=True,
@@ -256,28 +348,31 @@ def render_full_table(sorted_df: pd.DataFrame, key: str) -> None:
     _handle_selection(event, sorted_df)
 
 
-def _watchlist_table_display_df(rows_df: pd.DataFrame) -> pd.DataFrame:
+def _watchlist_table_display_df(rows_df: pd.DataFrame, tag_map: dict) -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "품목명": rows_df["item_name"].values,
-            "HS코드": [get_hs_code(mapping_df, n) or "미매핑" for n in rows_df["item_name"]],
+            "관심 품목": rows_df["item_name"].values,
+            "섹터": rows_df["category"].values,
+            "관련 기업": [_related_companies_str(n) or "–" for n in rows_df["item_name"]],
             "최근월 수출액": [_fmt_amount_abbr(v) for v in rows_df["export_amount"]],
             "YoY": [_fmt_pct_text(v) for v in rows_df["yoy"]],
             "MoM": [_fmt_pct_text(v) for v in rows_df["mom"]],
             "3M YoY": [_fmt_pct_text(v) for v in rows_df["ma3_yoy"]],
             "단가 YoY": [_fmt_pct_text(v) for v in rows_df["price_yoy"]],
             "물량 YoY": [_fmt_pct_text(v) for v in rows_df["volume_yoy"]],
-            "기준월": [str(p) for p in rows_df["period"]],
-            "잠정/확정": ["잠정치"] * len(rows_df),
-            "자동 코멘트": [generate_comment(r) for _, r in rows_df.iterrows()],
+            "알림 사유": [classify_alert_reason(r) for _, r in rows_df.iterrows()],
+            "해석 태그": [tag_map.get(n, "–") for n in rows_df["item_name"]],
         }
     )
 
 
 def render_watchlist_table(rows_df: pd.DataFrame, key: str) -> None:
-    display = _watchlist_table_display_df(rows_df)
+    tag_map = dict(zip(enriched_df["item_name"], enriched_df["tag"]))
+    display = _watchlist_table_display_df(rows_df, tag_map)
+    pct_cols = ["YoY", "MoM", "3M YoY", "단가 YoY", "물량 YoY"]
+    styler = display.style.map(_pct_text_color, subset=pct_cols)
     event = st.dataframe(
-        display, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key=key
+        styler, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key=key
     )
     _handle_selection(event, rows_df)
 
@@ -383,9 +478,156 @@ SIGNAL_TABS = [
     ("volume_yoy", "물량 증가"),
 ]
 
+TOP10_COLS = 5  # KPI 카드 개수와 맞춤
+
+
+# ---------- KPI 요약 (오늘의 요약) ----------
+def _kpi_definitions(enriched_df: pd.DataFrame) -> list[dict]:
+    """KPI 카드 5개의 정의. 카운트 계산과 클릭 시 드릴다운 목록이 항상 일치하도록
+    같은 mask를 두 군데서 재사용한다."""
+    favorites = st.session_state.favorites
+    return [
+        {
+            "id": "surge",
+            "label": "급증 품목 수",
+            "mask": enriched_df["yoy"] >= STRONG_YOY_PCT,
+            "sort_col": "yoy",
+            "ascending": False,
+        },
+        {
+            "id": "watchlist",
+            "label": "Watchlist 알림 수",
+            "mask": enriched_df["item_name"].isin(favorites),
+            "sort_col": "yoy",
+            "ascending": False,
+        },
+        {
+            "id": "price_up",
+            "label": "단가 상승 품목 수",
+            "mask": enriched_df["price_yoy"] > 0,
+            "sort_col": "price_yoy",
+            "ascending": False,
+        },
+        {
+            "id": "volume_up",
+            "label": "물량 증가 품목 수",
+            "mask": enriched_df["volume_yoy"] > 0,
+            "sort_col": "volume_yoy",
+            "ascending": False,
+        },
+        {
+            "id": "negative_turn",
+            "label": "마이너스 전환 품목 수",
+            "mask": enriched_df["tag"] == TAG_NEGATIVE_TURN,
+            "sort_col": "yoy",
+            "ascending": True,
+        },
+    ]
+
+
+def _render_kpi_drilldown(kpi: dict, enriched_df: pd.DataFrame) -> None:
+    subset = enriched_df[kpi["mask"]].sort_values(kpi["sort_col"], ascending=kpi["ascending"])
+    st.markdown(f"###### {kpi['label']} 목록 ({len(subset)}개)")
+    if subset.empty:
+        st.caption("해당하는 품목이 없습니다.")
+        return
+    display = pd.DataFrame(
+        {
+            "품목": subset["item_name"].values,
+            "섹터": subset["category"].values,
+            "최근월 수출액": [_fmt_amount_abbr(v) for v in subset["export_amount"]],
+            "YoY": [_fmt_pct_text(v) for v in subset["yoy"]],
+            "MoM": [_fmt_pct_text(v) for v in subset["mom"]],
+            "단가 YoY": [_fmt_pct_text(v) for v in subset["price_yoy"]],
+            "물량 YoY": [_fmt_pct_text(v) for v in subset["volume_yoy"]],
+            "해석 태그": subset["tag"].values,
+        }
+    )
+    pct_cols = ["YoY", "MoM", "단가 YoY", "물량 YoY"]
+    styler = display.style.map(_pct_text_color, subset=pct_cols)
+    event = st.dataframe(
+        styler, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key=f"kpi_list_{kpi['id']}"
+    )
+    _handle_selection(event, subset)
+
+
+def render_kpi_summary(enriched_df: pd.DataFrame) -> None:
+    kpis = _kpi_definitions(enriched_df)
+    cols = st.columns(TOP10_COLS)
+    for col, kpi in zip(cols, kpis):
+        with col:
+            count = int(kpi["mask"].sum())
+            st.markdown(
+                f"""
+                <div class="kpi-card">
+                  <div class="kpi-card-value">{count}</div>
+                  <div class="kpi-card-label">{kpi['label']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            is_open = st.session_state.selected_kpi == kpi["id"]
+            if st.button("숨기기 ▴" if is_open else "목록 보기 ▾", key=f"kpi_toggle_{kpi['id']}", width="stretch"):
+                st.session_state.selected_kpi = None if is_open else kpi["id"]
+                st.rerun()
+
+    active_kpi = next((k for k in kpis if k["id"] == st.session_state.selected_kpi), None)
+    if active_kpi:
+        _render_kpi_drilldown(active_kpi, enriched_df)
+
+
+# ---------- 오늘의 투자 시그널 Top 10 테이블 ----------
+def _signal_top10_display_df(top10: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "순위": range(1, len(top10) + 1),
+            "품목": top10["item_name"].values,
+            "섹터": top10["category"].values,
+            "최근월 수출액": [_fmt_amount_abbr(v) for v in top10["export_amount"]],
+            "YoY": [_fmt_pct_text(v) for v in top10["yoy"]],
+            "MoM": [_fmt_pct_text(v) for v in top10["mom"]],
+            "3M YoY": [_fmt_pct_text(v) for v in top10["ma3_yoy"]],
+            "단가 YoY": [_fmt_pct_text(v) for v in top10["price_yoy"]],
+            "물량 YoY": [_fmt_pct_text(v) for v in top10["volume_yoy"]],
+            "관련 기업": [_related_companies_str(n) or "–" for n in top10["item_name"]],
+            "Signal Score": top10["signal_score"].values,
+            "해석 태그": top10["tag"].values,
+        }
+    )
+
+
+def _pct_text_color(val) -> str:
+    """+/- 접두사로만 판단해서 색을 입힌다 (과하지 않게 - 텍스트 색만, 배경 없음)."""
+    if isinstance(val, str) and val.startswith("+"):
+        return f"color: {POSITIVE}"
+    if isinstance(val, str) and val.startswith("-"):
+        return f"color: {NEGATIVE}"
+    return ""
+
+
+def render_signal_top10_table(enriched_df: pd.DataFrame) -> None:
+    st.markdown("###### 오늘의 투자 시그널 Top 10 (Signal Score 기준)")
+    top10 = enriched_df.sort_values("signal_score", ascending=False).head(10).reset_index(drop=True)
+    if top10.empty:
+        st.caption("계산 가능한 데이터가 없습니다.")
+        return
+
+    display = _signal_top10_display_df(top10)
+    pct_cols = ["YoY", "MoM", "3M YoY", "단가 YoY", "물량 YoY"]
+    styler = display.style.map(_pct_text_color, subset=pct_cols).format({"Signal Score": "{:.1f}"})
+    event = st.dataframe(
+        styler, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="signal_top10_table"
+    )
+    _handle_selection(event, top10)
+
 
 def render_board() -> None:
     st.subheader("투자 시그널 보드")
+
+    render_kpi_summary(enriched_df)
+    render_signal_top10_table(enriched_df)
+    st.divider()
+
     tabs = st.tabs([label for _, label in SIGNAL_TABS])
     for tab, (col_key, label) in zip(tabs, SIGNAL_TABS):
         with tab:
@@ -412,7 +654,6 @@ def render_watchlist() -> None:
         st.info("Watchlist가 비어 있습니다. '전체 품목' 탭에서 ☆ 버튼을 눌러 추가해주세요.")
         return
     render_watchlist_table(fav_view, key="watchlist_table")
-    st.caption("추후 기업별 매핑이 정리되면 관련 기업, 컨센서스 대비 괴리, 데이터 신뢰도 컬럼을 추가할 예정입니다.")
 
 
 # ---------- 기업 검색 (실제 수출 데이터 + 관련 종목 참고 텍스트) ----------
@@ -459,6 +700,34 @@ def _related_companies_str(item_name: str) -> str:
     return " ".join(get_related_companies(mapping_df, item_name))
 
 
+def _all_items_table_display_df(view: pd.DataFrame, tag_map: dict) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "품목": view["item_name"].values,
+            "섹터": view["category"].values,
+            "최근월 수출액": [_fmt_amount_abbr(v) for v in view["export_amount"]],
+            "YoY": [_fmt_pct_text(v) for v in view["yoy"]],
+            "MoM": [_fmt_pct_text(v) for v in view["mom"]],
+            "3M YoY": [_fmt_pct_text(v) for v in view["ma3_yoy"]],
+            "단가 YoY": [_fmt_pct_text(v) for v in view["price_yoy"]],
+            "물량 YoY": [_fmt_pct_text(v) for v in view["volume_yoy"]],
+            "관련 기업": [_related_companies_str(n) or "–" for n in view["item_name"]],
+            "해석 태그": [tag_map.get(n, "–") for n in view["item_name"]],
+        }
+    )
+
+
+def render_all_items_table(view: pd.DataFrame) -> None:
+    tag_map = dict(zip(enriched_df["item_name"], enriched_df["tag"]))
+    display = _all_items_table_display_df(view, tag_map)
+    pct_cols = ["YoY", "MoM", "3M YoY", "단가 YoY", "물량 YoY"]
+    styler = display.style.map(_pct_text_color, subset=pct_cols)
+    event = st.dataframe(
+        styler, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="all_items_table"
+    )
+    _handle_selection(event, view)
+
+
 def render_all_items() -> None:
     st.subheader("전체 품목")
     search = st.text_input(
@@ -469,16 +738,21 @@ def render_all_items() -> None:
     category_options = ["전체", "즐겨찾기"] + categories
     cols_per_row = 6
     cat_rows = [category_options[i : i + cols_per_row] for i in range(0, len(category_options), cols_per_row)]
-    for row in cat_rows:
-        cols = st.columns(len(row))
-        for col, cat in zip(cols, row):
-            is_selected = st.session_state.selected_category == cat
-            if col.button(cat, key=f"cat_{cat}", type="primary" if is_selected else "secondary", width="stretch"):
-                st.session_state.selected_category = cat
-                st.session_state.page_size = PAGE_SIZE_STEP
-                st.rerun()
+    with st.container(key="category_filter_row"):
+        for row in cat_rows:
+            cols = st.columns(len(row))
+            for col, cat in zip(cols, row):
+                is_selected = st.session_state.selected_category == cat
+                if col.button(cat, key=f"cat_{cat}", type="primary" if is_selected else "secondary", width="stretch"):
+                    st.session_state.selected_category = cat
+                    st.session_state.page_size = PAGE_SIZE_STEP
+                    st.rerun()
 
-    sort_key = st.selectbox("정렬", ["수출액순", "YoY순", "MoM순", "이름순"], label_visibility="collapsed")
+    sc1, sc2 = st.columns([3, 1])
+    with sc1:
+        sort_key = st.selectbox("정렬", ["수출액순", "YoY순", "MoM순", "이름순"], label_visibility="collapsed")
+    with sc2:
+        st.segmented_control("보기", ["테이블형", "카드형"], key="items_view_mode", label_visibility="collapsed")
 
     view = latest_df.copy()
     if st.session_state.selected_category == "즐겨찾기":
@@ -505,6 +779,10 @@ def render_all_items() -> None:
         st.info("조건에 맞는 품목이 없습니다.")
         return
 
+    if st.session_state.items_view_mode == "테이블형":
+        render_all_items_table(view)
+        return
+
     page_view = view.head(st.session_state.page_size)
     cols = st.columns(3)
     for i, (_, row) in enumerate(page_view.iterrows()):
@@ -517,7 +795,89 @@ def render_all_items() -> None:
             st.rerun()
 
 
-# ---------- 2~4순위: 품목 상세 (요약/차트/단가·물량 분해/자동코멘트/원자료) ----------
+# ---------- 품목 상세 - 기간 선택 (모든 차트 공통 적용) ----------
+CHART_PERIOD_OPTIONS = ["1Y", "3Y", "5Y", "전체"]
+CHART_PERIOD_YEARS = {"1Y": 1, "3Y": 3, "5Y": 5, "전체": None}
+
+
+def _filter_by_period(hist: pd.DataFrame, period_label: str) -> pd.DataFrame:
+    years = CHART_PERIOD_YEARS.get(period_label)
+    if not years or hist.empty:
+        return hist
+    cutoff = hist["date"].max() - pd.DateOffset(years=years)
+    return hist[hist["date"] >= cutoff]
+
+
+# ---------- 품목 상세 - KPI 카드 5개 ----------
+def render_detail_kpi_cards(latest: pd.Series) -> None:
+    yoy_txt, yoy_color = _fmt_pct_color(latest["yoy"])
+    mom_txt, mom_color = _fmt_pct_color(latest["mom"])
+    ma3_txt, ma3_color = _fmt_pct_color(latest["ma3_yoy"])
+    price_txt, price_color = _fmt_pct_color(latest.get("price_yoy"))
+    vol_txt, vol_color = _fmt_pct_color(latest.get("volume_yoy"))
+
+    cards = [
+        ("최근월 수출금액", f'<span style="color:{TEXT_MAIN};">{_fmt_amount(latest["export_amount"])}</span>'),
+        ("YoY", f'<span style="color:{yoy_color};">{yoy_txt}</span>'),
+        ("MoM", f'<span style="color:{mom_color};">{mom_txt}</span>'),
+        ("3개월 이동평균 YoY", f'<span style="color:{ma3_color};">{ma3_txt}</span>'),
+        (
+            "단가·물량",
+            f'<span style="color:{price_color};">단가 {price_txt}</span> · <span style="color:{vol_color};">물량 {vol_txt}</span>',
+        ),
+    ]
+    cols = st.columns(len(cards))
+    for col, (label, value_html) in zip(cols, cards):
+        with col:
+            st.markdown(
+                f"""
+                <div class="kpi-card">
+                  <div class="kpi-card-value kpi-card-value--sm">{value_html}</div>
+                  <div class="kpi-card-label">{label}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+# ---------- 품목 상세 - 관련 기업 테이블 ----------
+def render_related_company_table(item_name: str, item_export_amount: float, company_metrics_df: pd.DataFrame) -> None:
+    table = build_related_company_table(item_name, mapping_df, company_metrics_df, item_export_amount)
+    if table.empty:
+        return
+
+    st.markdown("###### 관련 기업")
+    display = pd.DataFrame(
+        {
+            "기업명": table["company_name"].values,
+            "관련 품목": table["related_items"].values,
+            "최근월 수출액": [_fmt_amount_abbr(v) for v in table["export_amount"]],
+            "YoY": [_fmt_pct_text(v) for v in table["yoy"]],
+            "MoM": [_fmt_pct_text(v) for v in table["mom"]],
+            "해석": table["note"].values,
+        }
+    )
+    styler = display.style.map(_pct_text_color, subset=["YoY", "MoM"])
+    event = st.dataframe(
+        styler,
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"related_company_table_{item_name}",
+    )
+    selection = getattr(event, "selection", None) or (event.get("selection") if isinstance(event, dict) else None)
+    rows = (selection or {}).get("rows") if selection else None
+    if rows:
+        company_row = table.iloc[rows[0]]
+        if pd.notna(company_row["export_amount"]):
+            st.session_state.selected_company = (item_name, company_row["company_name"])
+            st.rerun()
+        else:
+            st.caption(f"'{company_row['company_name']}'은(는) 참고용 매핑만 있어 실측 상세 데이터가 없습니다.")
+
+
+# ---------- 2~4순위: 품목 상세 (정보 → KPI → 투자 해석 → 관련 기업 → 차트 → 원자료) ----------
 def render_detail(item_name: str) -> None:
     if st.button("← 목록으로"):
         st.session_state.selected_item = None
@@ -529,143 +889,150 @@ def render_detail(item_name: str) -> None:
         return
     latest = item_hist.iloc[-1]
 
+    # 1. 상단 정보
     hs = get_hs_code(mapping_df, item_name)
     companies = get_related_companies(mapping_df, item_name)
     st.subheader(item_name)
     meta_lines = [f'<div><span style="font-weight:600;">HS코드:</span> {hs or "미매핑"}</div>']
     if companies:
-        meta_lines.append(
-            f'<div><span style="font-weight:600;">관련 기업:</span> {", ".join(companies)}</div>'
-        )
+        meta_lines.append(f'<div><span style="font-weight:600;">관련 기업:</span> {", ".join(companies)}</div>')
+    meta_lines.append(f'<div><span style="font-weight:600;">기준월:</span> {latest["period"]} · 잠정치</div>')
     st.markdown(
         f'<div style="color:{TEXT_MAIN};font-size:13.5px;line-height:1.7;margin:4px 0 10px;">'
         + "".join(meta_lines) + '</div>',
         unsafe_allow_html=True,
     )
 
-    # 1. 핵심 요약 박스
-    st.markdown("##### 1. 핵심 요약")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("최근월 수출금액", _fmt_amount(latest["export_amount"]))
-    c1.metric("MoM", _fmt_pct_text(latest["mom"]))
-    c2.metric("YoY", _fmt_pct_text(latest["yoy"]))
-    c2.metric("3개월 이동평균 YoY", _fmt_pct_text(latest["ma3_yoy"]))
-    c3.metric("수출단가 YoY", _fmt_pct_text(latest["price_yoy"]))
-    c3.metric("수출물량 YoY", _fmt_pct_text(latest["volume_yoy"]))
-    st.caption(f"기준월: {latest['period']} · 잠정/확정: 잠정치")
+    # 2. KPI 카드 5개
+    render_detail_kpi_cards(latest)
 
+    # 3. 투자 해석 박스
     st.markdown(
-        f"""<div style="background:#ECFDF5;border:1px solid {POSITIVE};border-radius:8px;
-        padding:12px 16px;margin:10px 0;color:#065F46;font-size:13.5px;line-height:1.5;">
-        💬 {generate_comment(latest)}
+        f"""<div style="background:{ACTIVE_BG};border:1px solid {ACCENT};border-radius:8px;
+        padding:12px 16px;margin:10px 0;color:{ACCENT_DARK};font-size:13.5px;line-height:1.5;">
+        💬 {generate_detail_commentary(latest, companies)}
         </div>""",
         unsafe_allow_html=True,
     )
 
+    # 4. 관련 기업 테이블 (참고용 매핑 전체 + 실측 데이터 있는 기업은 클릭해서 상세로)
+    company_metrics_df = _load_company_with_metrics()
+    render_related_company_table(item_name, latest["export_amount"], company_metrics_df)
+
     has_price = item_hist["unit_price"].notna().any() if "unit_price" in item_hist.columns else False
 
-    # 2. 월별 수출금액 차트
-    st.markdown("##### 2. 월별 수출금액")
-    fig = go.Figure(go.Bar(x=item_hist["date"], y=item_hist["export_amount"], marker_color=ACCENT, name="수출금액"))
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
-    st.plotly_chart(fig, width="stretch")
+    # 5. 탭: 차트 분석 / 기업별 / 원자료
+    tab_charts, tab_company, tab_raw = st.tabs(["차트 분석", "기업별", "원자료"])
 
-    # 3. 단가 추이
-    st.markdown("##### 3. 단가 추이")
-    if has_price and item_hist["unit_price"].notna().any():
-        price_fig = go.Figure(
-            go.Scatter(x=item_hist["date"], y=item_hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가")
+    with tab_charts:
+        st.segmented_control("기간", CHART_PERIOD_OPTIONS, key="chart_period")
+        hist = _filter_by_period(item_hist, st.session_state.chart_period)
+
+        # 핵심 차트 3개 - 1열 전체 폭
+        st.markdown("###### 월별 수출금액")
+        fig = go.Figure(go.Bar(x=hist["date"], y=hist["export_amount"], marker_color=ACCENT, name="수출금액"))
+        fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+        st.markdown("###### 단가 추이")
+        if has_price and hist["unit_price"].notna().any():
+            price_fig = go.Figure(
+                go.Scatter(
+                    x=hist["date"], y=hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가"
+                )
+            )
+            price_fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(price_fig, width="stretch")
+        else:
+            st.caption("단가 데이터가 없어 생략합니다.")
+
+        st.markdown("###### 3개월 이동평균")
+        fig_ma = go.Figure()
+        fig_ma.add_trace(go.Bar(x=hist["date"], y=hist["export_amount"], marker_color="#DBEAFE", name="월별 수출금액"))
+        fig_ma.add_trace(
+            go.Scatter(x=hist["date"], y=hist["ma3_amount"], mode="lines", line=dict(color=WARNING, width=2), name="3개월 이동평균")
         )
-        price_fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(price_fig, width="stretch")
-    else:
-        st.caption("단가 데이터가 없어 생략합니다.")
-
-    # 4. 3개월 이동평균 차트
-    st.markdown("##### 4. 3개월 이동평균 (수출금액)")
-    fig_ma = go.Figure()
-    fig_ma.add_trace(go.Bar(x=item_hist["date"], y=item_hist["export_amount"], marker_color="#DBEAFE", name="월별 수출금액"))
-    fig_ma.add_trace(
-        go.Scatter(x=item_hist["date"], y=item_hist["ma3_amount"], mode="lines", line=dict(color=WARNING, width=2), name="3개월 이동평균")
-    )
-    fig_ma.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12))
-    st.plotly_chart(fig_ma, width="stretch")
-
-    # 5. YoY/MoM
-    st.markdown("##### 5. 수출금액 YoY / MoM")
-    yc, mc = st.columns(2)
-    with yc:
-        yoy_fig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY"))
-        yoy_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="YoY(%)", margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(yoy_fig, width="stretch")
-    with mc:
-        mom_fig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["mom"], mode="lines+markers", line=dict(color=WARNING), name="MoM"))
-        mom_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="MoM(%)", margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(mom_fig, width="stretch")
-
-    # 6. 수출단가 YoY
-    st.markdown("##### 6. 수출단가 YoY")
-    if has_price and item_hist["price_yoy"].notna().any():
-        pfig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["price_yoy"], mode="lines+markers", line=dict(color=PRICE_COLOR), name="단가 YoY"))
-        pfig.update_layout(template=PLOTLY_TEMPLATE, height=270, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(pfig, width="stretch")
-    else:
-        st.caption("단가 데이터가 없어 생략합니다.")
-
-    # 7. 수출물량 YoY
-    st.markdown("##### 7. 수출물량 YoY (추정치: 수출금액 ÷ 단가)")
-    if has_price and item_hist["volume_yoy"].notna().any():
-        vfig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["volume_yoy"], mode="lines+markers", line=dict(color=VOLUME_COLOR), name="물량 YoY"))
-        vfig.update_layout(template=PLOTLY_TEMPLATE, height=270, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(vfig, width="stretch")
-    else:
-        st.caption("단가 데이터가 없어 물량을 역산할 수 없습니다.")
-
-    # 8. 수출금액 증가 요인 분해
-    st.markdown("##### 8. 수출금액 증가 요인 분해 (단가 vs 물량)")
-    recent = item_hist.tail(12)
-    if has_price and (recent["price_yoy"].notna().any() or recent["volume_yoy"].notna().any()):
-        decomp_fig = go.Figure()
-        decomp_fig.add_trace(go.Bar(x=recent["date"], y=recent["price_yoy"], name="단가 YoY", marker_color=PRICE_COLOR))
-        decomp_fig.add_trace(go.Bar(x=recent["date"], y=recent["volume_yoy"], name="물량 YoY", marker_color=VOLUME_COLOR))
-        decomp_fig.update_layout(
-            barmode="group", template=PLOTLY_TEMPLATE, height=320, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12)
+        fig_ma.update_layout(
+            template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12)
         )
-        st.plotly_chart(decomp_fig, width="stretch")
-        st.caption(
-            "단가 YoY와 물량 YoY를 나란히 비교합니다. 단가 막대가 더 크면 ASP/믹스 개선, 물량 막대가 더 크면 "
-            "물량 중심 성장(마진 확인 필요)으로 해석할 수 있습니다."
-        )
-    else:
-        st.caption("단가 데이터가 없어 요인 분해를 생략합니다.")
+        st.plotly_chart(fig_ma, width="stretch")
 
-    # 9. 원자료 테이블
-    st.markdown("##### 9. 원자료 테이블")
-    raw_cols = ["date", "export_amount", "unit_price", "export_volume", "mom", "yoy", "price_yoy", "volume_yoy", "ma3_yoy"]
-    raw_cols = [c for c in raw_cols if c in item_hist.columns]
-    raw_display = item_hist[raw_cols].sort_values("date", ascending=False).copy()
-    raw_display.insert(0, "잠정/확정", "잠정치")
-    raw_display.rename(
-        columns={
-            "date": "기준일", "export_amount": "수출금액", "unit_price": "단가", "export_volume": "물량(추정)",
-            "mom": "MoM(%)", "yoy": "YoY(%)", "price_yoy": "단가YoY(%)", "volume_yoy": "물량YoY(%)", "ma3_yoy": "3개월평균YoY(%)",
-        },
-        inplace=True,
-    )
-    st.dataframe(raw_display, hide_index=True, width="stretch")
+        # 보조 차트 - 하단 2열 그리드 (좁으면 자동 1열)
+        st.markdown("###### 보조 지표")
+        yc, mc = st.columns(2)
+        with yc:
+            yoy_fig = go.Figure(go.Scatter(x=hist["date"], y=hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY"))
+            yoy_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출금액 YoY(%)", margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(yoy_fig, width="stretch")
+        with mc:
+            mom_fig = go.Figure(go.Scatter(x=hist["date"], y=hist["mom"], mode="lines+markers", line=dict(color=WARNING), name="MoM"))
+            mom_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출금액 MoM(%)", margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(mom_fig, width="stretch")
 
-    # 10. 기업별 수출 (EPIC Finance "품목 및 지역 커스텀 설정"에서 하위 기업 행이
-    # 실제로 설정된 품목만 존재 - 137개 품목 중 일부뿐이다. 데이터가 없으면 섹션
-    # 자체를 렌더링하지 않는다 (빈 섹션/에러 노출 금지).
-    company_metrics_df = _load_company_with_metrics()
-    company_view = get_company_breakdown(company_metrics_df, item_name)
-    if not company_view.empty:
-        st.markdown("##### 10. 기업별 수출 (클릭하여 상세)")
-        company_view = company_view.sort_values("export_amount", ascending=False).reset_index(drop=True)
-        cols = st.columns(CARD_COLS)
-        for i, (_, crow) in enumerate(company_view.iterrows()):
-            with cols[i % CARD_COLS]:
-                render_company_card(crow, item_name, company_metrics_df)
+        pc, vc = st.columns(2)
+        with pc:
+            if has_price and hist["price_yoy"].notna().any():
+                pfig = go.Figure(
+                    go.Scatter(x=hist["date"], y=hist["price_yoy"], mode="lines+markers", line=dict(color=PRICE_COLOR), name="단가 YoY")
+                )
+                pfig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출단가 YoY(%)", margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(pfig, width="stretch")
+            else:
+                st.caption("단가 데이터가 없어 생략합니다.")
+        with vc:
+            if has_price and hist["volume_yoy"].notna().any():
+                vfig = go.Figure(
+                    go.Scatter(x=hist["date"], y=hist["volume_yoy"], mode="lines+markers", line=dict(color=VOLUME_COLOR), name="물량 YoY")
+                )
+                vfig.update_layout(
+                    template=PLOTLY_TEMPLATE, height=270, title="수출물량 YoY(%, 추정치)", margin=dict(l=10, r=10, t=40, b=10)
+                )
+                st.plotly_chart(vfig, width="stretch")
+            else:
+                st.caption("단가 데이터가 없어 물량을 역산할 수 없습니다.")
+
+        recent = hist.tail(12)
+        if has_price and (recent["price_yoy"].notna().any() or recent["volume_yoy"].notna().any()):
+            st.markdown("###### 수출금액 증가 요인 분해 (단가 vs 물량, 최근 12개월)")
+            decomp_fig = go.Figure()
+            decomp_fig.add_trace(go.Bar(x=recent["date"], y=recent["price_yoy"], name="단가 YoY", marker_color=PRICE_COLOR))
+            decomp_fig.add_trace(go.Bar(x=recent["date"], y=recent["volume_yoy"], name="물량 YoY", marker_color=VOLUME_COLOR))
+            decomp_fig.update_layout(
+                barmode="group", template=PLOTLY_TEMPLATE, height=320, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12)
+            )
+            st.plotly_chart(decomp_fig, width="stretch")
+            st.caption(
+                "단가 YoY와 물량 YoY를 나란히 비교합니다. 단가 막대가 더 크면 ASP/믹스 개선, 물량 막대가 더 크면 "
+                "물량 중심 성장(마진 확인 필요)으로 해석할 수 있습니다."
+            )
+
+    with tab_company:
+        # EPIC Finance "품목 및 지역 커스텀 설정"에서 하위 기업 행이 실제로 설정된
+        # 품목만 존재 (137개 품목 중 일부뿐) - 없으면 안내만 표시.
+        company_view = get_company_breakdown(company_metrics_df, item_name)
+        if company_view.empty:
+            st.caption("이 품목은 EPIC Finance에 하위 기업(지역) 커스텀 설정이 없어 기업별 데이터가 없습니다.")
+        else:
+            company_view = company_view.sort_values("export_amount", ascending=False).reset_index(drop=True)
+            cols = st.columns(CARD_COLS)
+            for i, (_, crow) in enumerate(company_view.iterrows()):
+                with cols[i % CARD_COLS]:
+                    render_company_card(crow, item_name, company_metrics_df)
+
+    with tab_raw:
+        with st.expander("원자료 테이블 보기"):
+            raw_cols = ["date", "export_amount", "unit_price", "export_volume", "mom", "yoy", "price_yoy", "volume_yoy", "ma3_yoy"]
+            raw_cols = [c for c in raw_cols if c in item_hist.columns]
+            raw_display = item_hist[raw_cols].sort_values("date", ascending=False).copy()
+            raw_display.insert(0, "잠정/확정", "잠정치")
+            raw_display.rename(
+                columns={
+                    "date": "기준일", "export_amount": "수출금액", "unit_price": "단가", "export_volume": "물량(추정)",
+                    "mom": "MoM(%)", "yoy": "YoY(%)", "price_yoy": "단가YoY(%)", "volume_yoy": "물량YoY(%)", "ma3_yoy": "3개월평균YoY(%)",
+                },
+                inplace=True,
+            )
+            st.dataframe(raw_display, hide_index=True, width="stretch")
 
 
 # ---------- 기업 상세 (품목 상세와 유사한 레이아웃, 4단계 드릴다운) ----------
@@ -751,10 +1118,10 @@ with st.sidebar:
     st.markdown(f"##### 수출입 데이터")
 
     nav_options = [
-        ("board", "📊 투자 시그널"),
-        ("watchlist", "⭐ Watchlist"),
-        ("all", "📋 전체 품목"),
-        ("company_search", "🏢 기업 검색"),
+        ("board", "투자 시그널"),
+        ("watchlist", "Watchlist"),
+        ("all", "전체 품목"),
+        ("company_search", "기업 검색"),
     ]
     for key, label in nav_options:
         is_active = (
@@ -770,7 +1137,7 @@ with st.sidebar:
 
     st.divider()
 
-    with st.expander("⬇ 다운로드"):
+    with st.expander("다운로드"):
         raw_csv = history_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button("Raw Data", raw_csv, file_name="trade_history_raw.csv", mime="text/csv", width="stretch")
 
@@ -779,9 +1146,9 @@ with st.sidebar:
         st.download_button("PM Summary", pm_csv, file_name="pm_summary.csv", mime="text/csv", width="stretch")
         st.caption("PM Summary: 섹터/관련기업/컨센서스 비교는 매핑 정리 후 추가 예정")
 
-    with st.expander("⚙ 설정"):
+    with st.expander("설정"):
         if SCRAPER_PATH.exists():
-            if st.button("🔄 데이터 갱신", width="stretch"):
+            if st.button("데이터 갱신", width="stretch"):
                 # 로컬 전용: scrape_bigfinance.py는 headless=False로 크롬 창을 띄우고 세션 만료 시
                 # 터미널에서 로그인 대기(input())한다. subprocess.run은 `streamlit run app.py`를
                 # 실행한 그 터미널의 stdin을 그대로 물려받으므로 그 창에서 로그인하면 된다.

@@ -551,6 +551,249 @@ def generate_comment(row: pd.Series) -> str:
     return (headline + decomposition).strip()
 
 
+# ---------- 투자 시그널 보드 - Signal Score / 해석 태그 (Phase 2) ----------
+# generate_comment()와 같은 성격의 "이미 계산된 지표를 해석만 하는" 순수 추가 함수들.
+# compute_item_metrics() 등 원본 계산 로직은 건드리지 않는다.
+STRONG_MOM_PCT = 30.0  # "단기 급등" 판정용 MoM 임계값
+SMALL_AMOUNT_PERCENTILE = 0.2  # "노이즈 가능" 판정 - 최근월 수출액이 전체 품목 중 하위 몇 %인지
+HIGH_YOY_NOISE_PCT = 100.0  # "노이즈 가능" 판정 - 이 YoY(%)를 넘으면 "과도하게 높다"로 간주
+
+SIGNAL_SCORE_WEIGHTS = {"yoy": 0.35, "mom": 0.25, "ma3_yoy": 0.25, "price_yoy": 0.15}
+NEUTRAL_RANK_PCT = 50.0  # 결측/inf는 순위 중간값으로 대체해 점수를 왜곡하지 않는다.
+
+TAG_NEGATIVE_TURN = "마이너스 전환"
+TAG_NOISE = "노이즈 가능"
+TAG_CHECK_NEEDED = "확인 필요"
+TAG_SHORT_SPIKE = "단기 급등"
+TAG_TREND_IMPROVING = "추세 개선"
+TAG_PRICE_DRIVEN = "단가 주도"
+TAG_VOLUME_DRIVEN = "물량 주도"
+TAG_NONE = "–"
+
+
+def _percentile_rank(series: pd.Series) -> pd.Series:
+    """0~100 백분위 순위. 극단치(YoY +5000% 등)가 점수를 왜곡하지 않도록 raw 값 대신
+    순위를 쓴다. 결측/inf는 중립값(50)으로 대체해 계산이 깨지지 않게 한다."""
+    cleaned = series.replace([np.inf, -np.inf], np.nan)
+    ranked = cleaned.rank(pct=True) * 100
+    return ranked.fillna(NEUTRAL_RANK_PCT)
+
+
+def _classify_tag(row: pd.Series, small_amount_threshold: float) -> str:
+    """단순 규칙 기반 해석 태그 판정. 경고성 태그(마이너스 전환/노이즈 가능/확인 필요)를
+    먼저 체크하고, 없으면 추세/기여도 태그를 판정한다. 조건에 필요한 값이 NaN이면
+    해당 규칙은 건너뛴다(에러 대신 다음 규칙으로)."""
+    yoy, mom, ma3_yoy = row.get("yoy"), row.get("mom"), row.get("ma3_yoy")
+    price_yoy, volume_yoy, amount = row.get("price_yoy"), row.get("volume_yoy"), row.get("export_amount")
+
+    if (pd.notna(yoy) and yoy < 0) or (pd.notna(mom) and mom < 0):
+        return TAG_NEGATIVE_TURN
+
+    if (
+        pd.notna(amount)
+        and pd.notna(yoy)
+        and pd.notna(small_amount_threshold)
+        and amount <= small_amount_threshold
+        and yoy > HIGH_YOY_NOISE_PCT
+    ):
+        return TAG_NOISE
+
+    if pd.notna(price_yoy) and pd.notna(volume_yoy):
+        if (price_yoy > 0 and volume_yoy < 0) or (price_yoy < 0 and volume_yoy > 0):
+            return TAG_CHECK_NEEDED
+
+    if pd.notna(mom) and pd.notna(ma3_yoy) and mom > STRONG_MOM_PCT and ma3_yoy < STRONG_YOY_PCT:
+        return TAG_SHORT_SPIKE
+
+    if pd.notna(yoy) and pd.notna(ma3_yoy) and pd.notna(mom) and yoy > 0 and ma3_yoy > 0 and mom > 0:
+        return TAG_TREND_IMPROVING
+
+    if pd.notna(price_yoy) and pd.notna(volume_yoy) and price_yoy > volume_yoy and price_yoy > 0:
+        return TAG_PRICE_DRIVEN
+
+    if pd.notna(volume_yoy) and pd.notna(price_yoy) and volume_yoy > price_yoy and volume_yoy > 0:
+        return TAG_VOLUME_DRIVEN
+
+    return TAG_NONE
+
+
+def enrich_signal_board(latest_df: pd.DataFrame) -> pd.DataFrame:
+    """투자 시그널 보드용 signal_score(0~100)와 해석 태그(tag) 컬럼을 추가한 복사본을
+    반환한다. latest_df는 품목별 최신 시점 1행(예: get_latest_snapshot 결과)이어야 한다."""
+    if latest_df.empty:
+        return latest_df.assign(
+            signal_score=pd.Series(dtype="float64"),
+            tag=pd.Series(dtype="object"),
+        )
+
+    df = latest_df.copy()
+    weighted = pd.Series(0.0, index=df.index)
+    for col, weight in SIGNAL_SCORE_WEIGHTS.items():
+        rank = _percentile_rank(df[col]) if col in df.columns else pd.Series(NEUTRAL_RANK_PCT, index=df.index)
+        weighted = weighted + rank * weight
+    df["signal_score"] = weighted.round(1)
+
+    amount_cleaned = df["export_amount"].replace([np.inf, -np.inf], np.nan)
+    small_amount_threshold = amount_cleaned.quantile(SMALL_AMOUNT_PERCENTILE) if amount_cleaned.notna().any() else np.nan
+    df["tag"] = df.apply(lambda r: _classify_tag(r, small_amount_threshold), axis=1)
+    return df
+
+
+# ---------- 품목 상세 페이지 - 투자 해석 박스 / 관련 기업 테이블 (Phase 3) ----------
+DETAIL_COMPANY_MENTION_LIMIT = 2  # 투자 해석 문장에 언급할 관련 기업 최대 개수
+
+
+def generate_detail_commentary(row: pd.Series, related_companies: list[str]) -> str:
+    """품목 상세 페이지의 "투자 해석" 박스용 문장 생성. generate_comment()(카드/테이블의
+    짧은 자동 코멘트)와는 별도 함수 - 관련 기업명까지 포함해 더 긴 서술을 만든다.
+    데이터 값에 따라 문장이 자동으로 바뀌고, 필요한 값이 NaN이면 해당 부분은 생략한다."""
+    yoy = row.get("yoy")
+    ma3_yoy = row.get("ma3_yoy")
+    price_yoy = row.get("price_yoy")
+    volume_yoy = row.get("volume_yoy")
+
+    if pd.isna(yoy):
+        return "최근월 수출금액 YoY를 계산할 전년동월 데이터가 없어 투자 해석을 보류합니다."
+
+    direction = "증가했고" if yoy >= 0 else "감소했고"
+    headline = f"최근월 수출금액은 YoY {_fmt_signed(yoy)} {direction}"
+    if pd.notna(ma3_yoy):
+        if yoy >= STRONG_YOY_PCT and ma3_yoy < WEAK_YOY_PCT:
+            headline += f", 다만 3개월 이동평균 기준으로는 YoY {_fmt_signed(ma3_yoy)}에 그쳐 일시적 급증 가능성이 있습니다."
+        elif ma3_yoy >= WEAK_YOY_PCT:
+            headline += f", 3개월 이동평균 기준으로도 YoY {_fmt_signed(ma3_yoy)}를 기록해 추세 개선이 확인됩니다."
+        else:
+            headline += f", 3개월 이동평균 기준으로는 YoY {_fmt_signed(ma3_yoy)}로 추세 둔화가 우려됩니다."
+    else:
+        headline += "."
+
+    decomposition = ""
+    if pd.notna(price_yoy) and pd.notna(volume_yoy):
+        price_word = "상승" if price_yoy >= 0 else "하락"
+        volume_word = "증가" if volume_yoy >= 0 else "감소"
+        if abs(price_yoy) >= abs(volume_yoy) * 1.3 and abs(price_yoy) > 5:
+            interp = "가격(ASP) 중심으로 해석됩니다"
+        elif abs(volume_yoy) >= abs(price_yoy) * 1.3 and abs(volume_yoy) > 5:
+            interp = "가격보다는 물량 중심으로 해석됩니다"
+        else:
+            interp = "가격과 물량이 함께 기여한 것으로 해석됩니다"
+        trend_word = "성장" if yoy >= 0 else "감소"
+        decomposition = (
+            f" 수출단가는 YoY {_fmt_signed(price_yoy)}로 {price_word}했지만 물량은 YoY {_fmt_signed(volume_yoy)} "
+            f"{volume_word}해, 현재 {trend_word}은 {interp}."
+        )
+    elif pd.notna(price_yoy):
+        decomposition = f" 수출단가는 YoY {_fmt_signed(price_yoy)}입니다 (물량 데이터 없음)."
+
+    company_note = ""
+    if related_companies:
+        shown = related_companies[:DETAIL_COMPANY_MENTION_LIMIT]
+        suffix = " 등" if len(related_companies) > DETAIL_COMPANY_MENTION_LIMIT else ""
+        company_note = f" 관련 기업 중 {', '.join(shown)}{suffix}의 해외 매출 흐름을 추가 확인할 필요가 있습니다."
+
+    return (headline + decomposition + company_note).strip()
+
+
+def build_related_company_table(
+    item_name: str, mapping_df: pd.DataFrame, company_metrics_df: pd.DataFrame, item_export_amount: float
+) -> pd.DataFrame:
+    """품목 상세 페이지의 "관련 기업" 테이블용 데이터.
+    item_mapping.csv의 참고용 관련 기업(A) 전체를 행으로 두고, company_trade_history_long.csv에
+    실측 데이터(B)가 있는 기업만 최근월 수출액/YoY/MoM을 채운다. 실측이 없으면 값은 NaN이고
+    note에 "실측 데이터 없음"으로 표시한다 (임의로 값을 채우지 않는다).
+    related_items 컬럼은 해당 기업이 관련된 전체 품목 목록(현재 품목 포함)을 빠짐없이 보여준다."""
+    companies = get_related_companies(mapping_df, item_name)
+    if not companies:
+        return pd.DataFrame(columns=["company_name", "related_items", "export_amount", "yoy", "mom", "note"])
+
+    company_latest = (
+        get_company_latest_snapshot(company_metrics_df) if not company_metrics_df.empty else company_metrics_df
+    )
+
+    rows = []
+    for company in companies:
+        hits = search_related_company_items(mapping_df, company)
+        related_item_names = sorted({h["item_name"] for h in hits if company in h["matched_companies"]})
+        if not related_item_names:
+            related_item_names = [item_name]
+
+        real_row = None
+        if company_latest is not None and not company_latest.empty:
+            match = company_latest[
+                (company_latest["item_name"] == item_name) & (company_latest["company_name"] == company)
+            ]
+            if not match.empty:
+                real_row = match.iloc[0]
+
+        if real_row is not None:
+            amount, yoy, mom = real_row["export_amount"], real_row["yoy"], real_row["mom"]
+            if pd.notna(amount) and item_export_amount:
+                ratio = amount / item_export_amount * 100
+                note = f"이 품목 수출의 약 {ratio:.0f}% 차지 (실측)"
+            else:
+                note = "실측 데이터 있음"
+        else:
+            amount, yoy, mom = np.nan, np.nan, np.nan
+            note = "실측 데이터 없음 - 참고용 매핑"
+
+        rows.append(
+            {
+                "company_name": company,
+                "related_items": ", ".join(related_item_names),
+                "export_amount": amount,
+                "yoy": yoy,
+                "mom": mom,
+                "note": note,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# ---------- Watchlist - 알림 사유 (Phase 5) ----------
+# _classify_tag(해석 태그)와는 다른 관점 - Watchlist는 "이번 달에 왜 다시 봐야 하는지"에
+# 초점을 맞춘 판정이라 임계값/우선순위를 별도로 둔다. 기존 계산 로직(compute_item_metrics 등)은
+# 건드리지 않고 이미 계산된 ma3_yoy_prev 등을 그대로 재사용한다.
+ALERT_MOM_DROP_PCT = -15.0  # "MoM 급락" 판정 임계값
+
+ALERT_MOM_CRASH = "MoM 급락"
+ALERT_YOY_SLOWDOWN = "YoY 둔화"
+ALERT_SURGE = "수출액 급증"
+ALERT_TREND_IMPROVING = "3개월 추세 개선"
+ALERT_PRICE_TURN = "단가 상승 전환"
+ALERT_VOLUME_REBOUND = "물량 반등"
+ALERT_CHECK_NEEDED = "확인 필요"
+
+
+def classify_alert_reason(row: pd.Series) -> str:
+    """Watchlist 표의 "알림 사유" 판정. 위에서부터 먼저 맞는 조건 하나만 채택한다."""
+    yoy, mom = row.get("yoy"), row.get("mom")
+    ma3_yoy, ma3_yoy_prev = row.get("ma3_yoy"), row.get("ma3_yoy_prev")
+    price_yoy, volume_yoy = row.get("price_yoy"), row.get("volume_yoy")
+
+    if pd.isna(yoy):
+        return ALERT_CHECK_NEEDED
+
+    if pd.notna(mom) and mom <= ALERT_MOM_DROP_PCT:
+        return ALERT_MOM_CRASH
+
+    if pd.notna(ma3_yoy) and pd.notna(ma3_yoy_prev) and ma3_yoy < ma3_yoy_prev and yoy < STRONG_YOY_PCT:
+        return ALERT_YOY_SLOWDOWN
+
+    if yoy >= STRONG_YOY_PCT:
+        return ALERT_SURGE
+
+    if pd.notna(ma3_yoy) and pd.notna(ma3_yoy_prev) and ma3_yoy > WEAK_YOY_PCT and ma3_yoy > ma3_yoy_prev:
+        return ALERT_TREND_IMPROVING
+
+    if pd.notna(price_yoy) and price_yoy > WEAK_YOY_PCT and (pd.isna(volume_yoy) or volume_yoy <= WEAK_YOY_PCT):
+        return ALERT_PRICE_TURN
+
+    if pd.notna(volume_yoy) and pd.notna(mom) and volume_yoy > WEAK_YOY_PCT and mom > WEAK_YOY_PCT:
+        return ALERT_VOLUME_REBOUND
+
+    return ALERT_CHECK_NEEDED
+
+
 def build_pm_summary(latest_df: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
     """PM Summary 다운로드용 요약 테이블. 기업/섹터/컨센서스 등은 매핑 데이터가 정리되면 추가."""
     rows = []
