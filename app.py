@@ -466,8 +466,19 @@ def render_detail(item_name: str) -> None:
     fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig, width="stretch")
 
-    # 3. 3개월 이동평균 차트
-    st.markdown("##### 3. 3개월 이동평균 (수출금액)")
+    # 3. 단가 추이
+    st.markdown("##### 3. 단가 추이")
+    if has_price and item_hist["unit_price"].notna().any():
+        price_fig = go.Figure(
+            go.Scatter(x=item_hist["date"], y=item_hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가")
+        )
+        price_fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(price_fig, width="stretch")
+    else:
+        st.caption("단가 데이터가 없어 생략합니다.")
+
+    # 4. 3개월 이동평균 차트
+    st.markdown("##### 4. 3개월 이동평균 (수출금액)")
     fig_ma = go.Figure()
     fig_ma.add_trace(go.Bar(x=item_hist["date"], y=item_hist["export_amount"], marker_color="#DBEAFE", name="월별 수출금액"))
     fig_ma.add_trace(
@@ -476,8 +487,8 @@ def render_detail(item_name: str) -> None:
     fig_ma.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig_ma, width="stretch")
 
-    # 4. YoY/MoM
-    st.markdown("##### 4. 수출금액 YoY / MoM")
+    # 5. YoY/MoM
+    st.markdown("##### 5. 수출금액 YoY / MoM")
     yc, mc = st.columns(2)
     with yc:
         yoy_fig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY"))
@@ -488,8 +499,8 @@ def render_detail(item_name: str) -> None:
         mom_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="MoM(%)", margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(mom_fig, width="stretch")
 
-    # 5. 수출단가 YoY
-    st.markdown("##### 5. 수출단가 YoY")
+    # 6. 수출단가 YoY
+    st.markdown("##### 6. 수출단가 YoY")
     if has_price and item_hist["price_yoy"].notna().any():
         pfig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["price_yoy"], mode="lines+markers", line=dict(color=PRICE_COLOR), name="단가 YoY"))
         pfig.update_layout(template=PLOTLY_TEMPLATE, height=270, margin=dict(l=10, r=10, t=10, b=10))
@@ -497,8 +508,8 @@ def render_detail(item_name: str) -> None:
     else:
         st.caption("단가 데이터가 없어 생략합니다.")
 
-    # 6. 수출물량 YoY
-    st.markdown("##### 6. 수출물량 YoY (추정치: 수출금액 ÷ 단가)")
+    # 7. 수출물량 YoY
+    st.markdown("##### 7. 수출물량 YoY (추정치: 수출금액 ÷ 단가)")
     if has_price and item_hist["volume_yoy"].notna().any():
         vfig = go.Figure(go.Scatter(x=item_hist["date"], y=item_hist["volume_yoy"], mode="lines+markers", line=dict(color=VOLUME_COLOR), name="물량 YoY"))
         vfig.update_layout(template=PLOTLY_TEMPLATE, height=270, margin=dict(l=10, r=10, t=10, b=10))
@@ -506,8 +517,8 @@ def render_detail(item_name: str) -> None:
     else:
         st.caption("단가 데이터가 없어 물량을 역산할 수 없습니다.")
 
-    # 7. 수출금액 증가 요인 분해
-    st.markdown("##### 7. 수출금액 증가 요인 분해 (단가 vs 물량)")
+    # 8. 수출금액 증가 요인 분해
+    st.markdown("##### 8. 수출금액 증가 요인 분해 (단가 vs 물량)")
     recent = item_hist.tail(12)
     if has_price and (recent["price_yoy"].notna().any() or recent["volume_yoy"].notna().any()):
         decomp_fig = go.Figure()
@@ -524,8 +535,8 @@ def render_detail(item_name: str) -> None:
     else:
         st.caption("단가 데이터가 없어 요인 분해를 생략합니다.")
 
-    # 8. 원자료 테이블
-    st.markdown("##### 8. 원자료 테이블")
+    # 9. 원자료 테이블
+    st.markdown("##### 9. 원자료 테이블")
     raw_cols = ["date", "export_amount", "unit_price", "export_volume", "mom", "yoy", "price_yoy", "volume_yoy", "ma3_yoy"]
     raw_cols = [c for c in raw_cols if c in item_hist.columns]
     raw_display = item_hist[raw_cols].sort_values("date", ascending=False).copy()
