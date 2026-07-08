@@ -6,3 +6,6 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+.auth/
+favorites.json
+.claude/
