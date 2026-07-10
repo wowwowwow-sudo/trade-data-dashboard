@@ -1,7 +1,13 @@
 """
-bigfinance.co.kr(EPIC Finance) "잠정 수출 품목 리스트" 페이지에서 품목별로
-모달(차트)을 열어 "수출 금액"/"수출 단가"를 전체 기간(All) 엑셀로 다운로드하고,
-그 히스토리를 trade_history_long.csv에 누적하는 스크립트.
+bigfinance.co.kr(EPIC Finance) "잠정 수출 품목 지역별 리스트"("품목 및 지역 커스텀
+설정") 페이지에서 품목별로 모달(차트)을 열어 "수출 금액"/"수출 단가"를 전체 기간(All)
+엑셀로 다운로드하고, 그 히스토리를 trade_history_long.csv에 누적하는 스크립트.
+같은 화면에서 하위 기업(지역) 행이 설정된 품목은 펼쳐서 기업별 데이터도 함께
+company_trade_history_long.csv에 누적한다.
+
+이 화면 하나로 품목 레벨 + 기업 레벨을 모두 처리한다: 상위 품목 행은 "품목 커스텀
+설정" 화면과 동일한 목록이고 동일하게 .button__modal 다운로드 버튼을 가지고 있어서
+(2026-07-10 확인), 두 화면을 따로 방문할 필요가 없다.
 
 목록 페이지의 요약 테이블(최신월/전년동월/전월 5개 컬럼)만 읽는 대신, 품목별
 다운로드를 쓰는 이유: 다운로드 파일에는 2016년부터 월말 기준 전체 히스토리가
@@ -12,41 +18,49 @@ bigfinance.co.kr(EPIC Finance) "잠정 수출 품목 리스트" 페이지에서 
   - Playwright 전용 크롬 프로필(.auth/chrome_profile)을 headless=False로 띄운다.
     이 폴더는 평소 쓰는 크롬의 User Data 폴더와 완전히 분리되어 있어
     평소 크롬이 켜져 있어도 충돌하지 않는다.
-  - 최초 실행: 로그인 페이지가 뜨면 사용자가 직접 로그인(또는 크롬 자동완성 사용)
-    -> Enter를 누르면 계속 진행. 로그인 상태는 프로필 폴더에 자동 저장된다.
+  - 최초 실행: 로그인 페이지가 뜨면 .env의 EPIC_FINANCE_ID/EPIC_FINANCE_PW로 자동
+    로그인을 시도한다(무인 스케줄 실행용). 값이 없거나 자동 로그인이 실패하면(셀렉터가
+    안 맞거나 캡차/OTP 등 추가 인증) 기존처럼 사용자가 직접 로그인 -> Enter로 계속
+    진행하는 방식으로 폴백한다. 로그인 상태는 프로필 폴더에 자동 저장된다.
   - 이후 실행: 프로필에 저장된 쿠키로 로그인 없이 바로 진행.
-  - 세션 만료로 로그인 페이지가 다시 뜨면 동일하게 안내 후 재로그인 대기.
+  - 세션 만료로 로그인 페이지가 다시 뜨면 동일하게 자동 로그인 시도 -> 실패 시 수동 대기.
 
-비밀번호는 이 스크립트가 절대 입력받거나 저장하지 않는다. 크롬이 자기 프로필
-안에서 자동완성/비밀번호 저장을 처리할 뿐이다.
+비밀번호는 코드에 하드코딩하지 않고 .env(.env.example 참고)에서만 읽는다. 값이 없으면
+지금까지와 동일하게 크롬 자동완성/사용자 수동 입력에 의존한다.
 
 실행: python scrape_bigfinance.py
 """
 
+import os
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PWTimeoutError
 from playwright.sync_api import sync_playwright
 
 from append_snapshot import append_company_snapshot, append_snapshot
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 PROFILE_DIR = BASE_DIR / ".auth" / "chrome_profile"
 DEBUG_DIR = BASE_DIR / ".auth" / "debug"
 DOWNLOAD_DIR = BASE_DIR / ".auth" / "downloads"
 
+EPIC_FINANCE_ID = os.environ.get("EPIC_FINANCE_ID")
+EPIC_FINANCE_PW = os.environ.get("EPIC_FINANCE_PW")
+
 BASE_URL = "https://bigfinance.co.kr/"
 # custom-product-group URL로 직접 goto하면 SPA가 딥링크를 제대로 처리하지 못하고
 # 엉뚱한 화면(Market 기본 화면, 국가별 무역수지 화면 등)으로 보내는 경우가 있어서
-# 실제 화면 메뉴를 Launch Data -> TRASS-BF 수출 데이터 -> 잠정 수출(펼치기) -> 품목 커스텀 설정
+# 실제 화면 메뉴를 Launch Data -> TRASS-BF 수출 데이터 -> 잠정 수출(펼치기) -> 품목 및 지역 커스텀 설정
 # 순서로 그대로 클릭해서 들어간다 (_click_through_to_target 참고).
-PAGE_HEADING_TEXT = "잠정 수출 품목 리스트"  # "...지역별 리스트"(다른 메뉴)와 구분되는 이 페이지 고유 제목
 
 # 이 페이지는 <table> 하나가 아니라 품목명 칼럼(.label__columns)과
 # 수출금액/단가 칼럼(.data__columns)이 좌우로 분리된 커스텀 그리드(.group-column-sort-table)다.
-# 이 그리드 클래스는 다른 메뉴(국가별 등)에서도 재사용되므로, PAGE_HEADING_TEXT로
+# 이 그리드 클래스는 다른 메뉴(국가별 등)에서도 재사용되므로, REGION_PAGE_HEADING_TEXT로
 # 페이지를 먼저 식별한 뒤에만 신뢰한다.
 GRID_SELECTOR = ".group-column-sort-table"
 
@@ -101,7 +115,6 @@ def _dump_debug(page, tag: str) -> None:
 # ---------- 로그인 & 이동 ----------
 MAX_LOGIN_ATTEMPTS = 2
 MAX_NAV_ATTEMPTS = 3  # 로그인 문제가 아닌데 엉뚱한 페이지로 튕기는 SPA 라우팅 타이밍 이슈 대응
-DATA_READY_SELECTOR = f"{GRID_SELECTOR} .label__columns table tbody tr"
 
 
 def _looks_like_login(page) -> bool:
@@ -115,7 +128,59 @@ def _looks_like_login(page) -> bool:
         return False
 
 
-def _click_through_to_target(page, target_label: str = "품목 커스텀 설정") -> None:
+def _dismiss_landing_page(page) -> bool:
+    """BASE_URL이 로그인 여부와 무관하게 마케팅 랜딩 페이지(bigfinance.co.kr/home)를
+    먼저 보여주는 경우가 있다(2026-07-10 확인: landing__header의 '로그인' 메뉴 클릭이
+    한 번 더 필요). 랜딩 페이지가 아니면(이미 로그인 폼이거나 로그인된 앱이면) 아무것도
+    하지 않는다."""
+    login_menu = page.locator(".landing__header .menu__item", has_text="로그인")
+    if login_menu.count() == 0:
+        return False
+    try:
+        login_menu.first.click(timeout=5000)
+        page.wait_for_timeout(500)
+        return True
+    except PWTimeoutError:
+        return False
+
+
+def _try_auto_login(page) -> bool:
+    """EPIC_FINANCE_ID/EPIC_FINANCE_PW(.env)가 설정돼 있으면 로그인 폼에 자동으로
+    입력해본다. 정확한 폼 구조를 검증한 적이 없어 일반적인 패턴(비밀번호 입력칸과 그
+    앞의 아이디/이메일 입력칸)으로 시도한다 - 셀렉터가 안 맞거나 캡차/OTP 등 추가
+    인증이 뜨면 False를 반환하고, 호출부에서 기존 수동 로그인 대기로 폴백한다."""
+    if not (EPIC_FINANCE_ID and EPIC_FINANCE_PW):
+        return False
+    try:
+        pw_input = page.locator("input[type='password']").first
+        pw_input.wait_for(timeout=3000)
+        id_input = page.locator(
+            "input[type='text'], input[type='email'], input:not([type])"
+        ).first
+        id_input.fill(EPIC_FINANCE_ID, timeout=3000)
+        pw_input.fill(EPIC_FINANCE_PW, timeout=3000)
+        pw_input.press("Enter")
+        page.wait_for_timeout(2000)
+        if _looks_like_login(page):
+            print("[정보] 자동 로그인을 시도했지만 여전히 로그인 페이지입니다 (아이디/비밀번호 오류 또는 추가 인증 필요).")
+            return False
+        print("[정보] .env 자격증명으로 자동 로그인했습니다.")
+        return True
+    except PWTimeoutError:
+        print("[정보] 자동 로그인 시도 중 입력 필드를 찾지 못했습니다. 수동 로그인으로 전환합니다.")
+        return False
+
+
+def _handle_login_prompt(page) -> None:
+    if _try_auto_login(page):
+        return
+    print("\n로그인이 필요합니다(최초 로그인 또는 세션 만료). 열린 크롬 창에서 로그인해주세요.")
+    print("(자동완성/저장된 비밀번호가 있다면 채워질 수 있습니다. 없다면 직접 입력 후")
+    print(" '비밀번호 저장'을 눌러두면 다음부터 자동완성이 동작합니다.)")
+    input("로그인 완료 후 이 창(터미널)에서 Enter를 눌러주세요...")
+
+
+def _click_through_to_target(page, target_label: str) -> None:
     """URL 직접 이동 대신, 실제 화면의 메뉴 텍스트를 순서대로 클릭해서 목표 페이지로 이동.
 
     사이드바 구조 (.auth/debug HTML로 확인):
@@ -155,15 +220,6 @@ def _click_through_to_target(page, target_label: str = "품목 커스텀 설정"
     page.wait_for_timeout(500)
 
 
-def _page_ready(page) -> bool:
-    try:
-        page.wait_for_selector(f"text={PAGE_HEADING_TEXT}", timeout=10000)
-        page.wait_for_selector(DATA_READY_SELECTOR, timeout=10000)
-        return True
-    except PWTimeoutError:
-        return False
-
-
 def _region_page_ready(page) -> bool:
     try:
         page.wait_for_selector(f"text={REGION_PAGE_HEADING_TEXT}", timeout=10000)
@@ -173,38 +229,38 @@ def _region_page_ready(page) -> bool:
         return False
 
 
-def _ensure_ready(page, target_label: str, page_ready_fn, ready_desc: str) -> None:
-    """ensure_data_ready/ensure_region_data_ready 공용 재시도/재로그인 로직.
-    target_label만 다른 메뉴로 이동하는 두 화면(품목 커스텀 설정 / 품목 및 지역
-    커스텀 설정)에 그대로 재사용한다."""
+def ensure_region_data_ready(page) -> None:
+    """목표 페이지(잠정 수출 품목 지역별 리스트 - 품목 레벨 + 기업/지역 펼치기가
+    모두 가능한 화면)가 뜰 때까지 기다린다.
+    - 로그인 페이지로 튕기면(최초 로그인이든, 세션 만료로 뒤늦게 튕기는 경우든) 재로그인을 안내하고 재시도한다.
+    - 로그인은 됐는데 엉뚱한 메뉴로 가 있으면(같은 그리드 컴포넌트를 쓰는 다른 메뉴 등),
+      메뉴를 다시 클릭해서 재시도한다.
+    """
     login_attempts = 0
     for attempt in range(1, MAX_NAV_ATTEMPTS + 1):
         page.goto(BASE_URL, wait_until="domcontentloaded")
+        _dismiss_landing_page(page)
         if _looks_like_login(page):
             login_attempts += 1
             if login_attempts >= MAX_LOGIN_ATTEMPTS:
                 break
-            print("\n로그인이 필요합니다(최초 로그인 또는 세션 만료). 열린 크롬 창에서 로그인해주세요.")
-            print("(자동완성/저장된 비밀번호가 있다면 채워질 수 있습니다. 없다면 직접 입력 후")
-            print(" '비밀번호 저장'을 눌러두면 다음부터 자동완성이 동작합니다.)")
-            input("로그인 완료 후 이 창(터미널)에서 Enter를 눌러주세요...")
+            _handle_login_prompt(page)
             continue
 
         try:
-            _click_through_to_target(page, target_label=target_label)
+            _click_through_to_target(page, target_label=REGION_MENU_LABEL)
         except PWTimeoutError:
             pass  # 메뉴 클릭이 실패해도 아래에서 로그인/미도달 여부를 다시 판단
 
-        if page_ready_fn(page):
-            print(f"로그인 확인 완료. 목표 페이지({ready_desc})를 찾았습니다.")
+        if _region_page_ready(page):
+            print(f"로그인 확인 완료. 목표 페이지({REGION_PAGE_HEADING_TEXT})를 찾았습니다.")
             return
 
         if _looks_like_login(page):
             login_attempts += 1
             if login_attempts >= MAX_LOGIN_ATTEMPTS:
                 break
-            print("\n로그인이 필요합니다. 열린 크롬 창에서 로그인해주세요.")
-            input("로그인 완료 후 이 창(터미널)에서 Enter를 눌러주세요...")
+            _handle_login_prompt(page)
             continue
 
         print(f"[정보] {attempt}번째 시도에서 목표 페이지를 찾지 못했습니다 (현재 URL: {page.url}). 재시도합니다.")
@@ -217,22 +273,6 @@ def _ensure_ready(page, target_label: str, page_ready_fn, ready_desc: str) -> No
         "여러 번 재시도했지만 목표 페이지를 찾지 못했습니다. "
         ".auth/debug 폴더를 확인해주세요."
     )
-
-
-def ensure_data_ready(page) -> None:
-    """목표 페이지(잠정 수출 품목 리스트)가 뜰 때까지 기다린다.
-    - 로그인 페이지로 튕기면(최초 로그인이든, 세션 만료로 뒤늦게 튕기는 경우든) 재로그인을 안내하고 재시도한다.
-    - 로그인은 됐는데 엉뚱한 메뉴로 가 있으면(같은 그리드 컴포넌트를 쓰는 다른 메뉴 등),
-      메뉴를 다시 클릭해서 재시도한다.
-    """
-    _ensure_ready(page, "품목 커스텀 설정", _page_ready, PAGE_HEADING_TEXT)
-
-
-def ensure_region_data_ready(page) -> None:
-    """목표 페이지(잠정 수출 품목 지역별 리스트 - 기업/지역 펼치기가 가능한 화면)가
-    뜰 때까지 기다린다. ensure_data_ready와 동일한 재시도/재로그인 로직을 쓰되
-    다른 메뉴로 이동한다."""
-    _ensure_ready(page, REGION_MENU_LABEL, _region_page_ready, REGION_PAGE_HEADING_TEXT)
 
 
 # ---------- 품목 모달: 열기/닫기/지표 전환/다운로드 ----------
@@ -301,28 +341,75 @@ def _validate_latest_yoy(export_month: pd.DataFrame, item_name: str) -> None:
         )
 
 
-# ---------- 전체 품목 순회 ----------
-def scrape_all_items(page) -> list[dict]:
+# ---------- 품목 및 지역 커스텀 설정: 품목 레벨 + 하위 기업(지역) 순회 (한 번에) ----------
+def _ensure_row_expanded(page, row) -> None:
+    """품목 행의 펼침 아이콘(svg polyline)이 '접힘' 좌표면 클릭해서 펼친다.
+    이미 펼쳐져 있으면 아무것도 하지 않는다 (잘못 클릭하면 오히려 접혀버리므로)."""
+    polyline = row.locator(".expand__group svg polyline").first
+    if polyline.count() == 0:
+        return
+    points = (polyline.get_attribute("points") or "").strip()
+    if points == COLLAPSED_POLYLINE_POINTS:
+        row.locator(".expand__group svg").first.click(timeout=5000, force=True)
+        page.wait_for_timeout(500)
+
+
+def scrape_items_and_companies(page) -> tuple[list[dict], list[dict]]:
+    """"품목 및 지역 커스텀 설정" 화면 한 번 방문으로 품목 레벨 데이터
+    (trade_history_long.csv용)와 하위 기업(지역) 데이터(company_trade_history_long.csv용)를
+    함께 수집한다. 이 화면의 상위 품목 행은 "품목 커스텀 설정" 화면과 동일한 목록이고
+    동일하게 .button__modal 다운로드 버튼을 가지고 있어(2026-07-10 확인), 두 화면을
+    따로 방문할 필요가 없다.
+
+    한 품목에 하위 기업이 있는지는 펼치기 전에는 알 수 없다 (화면 기본 접힘/펼침
+    상태와 무관 - probe_expand_full.py로 실제 확인함: IC칩처럼 접힌 채로 보이는
+    품목도 펼치면 하위 기업이 나오는 경우가 있었다). 그래서 품목별로 먼저 상위 행을
+    다운로드한 뒤 바로 펼쳐보고, 펼친 직후 바로 다음에 tr-{부모}-{자식} 형태의 행이
+    있으면(=번호가 매겨진 실제 기업 행) 그것만 채택하고, "+지역 추가" placeholder만
+    있으면 건너뛴다. 특정 품목명을 하드코딩하지 않는다 - 품목 및 지역 커스텀 설정은
+    계속 추가될 수 있기 때문.
+    """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
+    ensure_region_data_ready(page)
     body = page.locator(f"{GRID_SELECTOR}__body")
-    item_rows = body.locator(".label__columns table tbody tr")
-    n_rows = item_rows.count()
-    if n_rows == 0:
-        _dump_debug(page, "no_item_rows_found")
-        raise RuntimeError("품목명 목록(.label__columns)을 찾지 못했습니다. .auth/debug 폴더를 확인해주세요.")
-    print(f"[정보] {n_rows}개 품목을 순회하며 다운로드합니다 (품목당 수출금액+단가 2회 다운로드).")
 
-    all_records: list[dict] = []
+    # .group__item__name.main-text가 있는 행만 상위 품목 행이다 (하위 기업 행은
+    # .group__item__name.sub-text, placeholder 행은 .group__item__name__option을 쓴다 -
+    # probe_expand_ccl.py/probe_expand_full.py로 실제 DOM 확인함). 텍스트("전체" 접두어)
+    # 매칭 대신 클래스로 구분해야 Playwright의 텍스트 정규화 이슈를 피할 수 있다
+    # (2026-07-07: has_text 정규식 앵커가 실제로는 매칭되지 않는 문제를 겪음).
+    top_rows = body.locator(".label__columns table tbody tr").filter(has=page.locator(".group__item__name.main-text"))
+    n_top = top_rows.count()
+    if n_top == 0:
+        _dump_debug(page, "no_region_rows_found")
+        raise RuntimeError("품목 및 지역 커스텀 설정 화면에서 품목 행을 찾지 못했습니다. .auth/debug 폴더를 확인해주세요.")
+
+    item_names = []
+    for i in range(n_top):
+        name_el = top_rows.nth(i).locator(".group__item__name.main-text").first
+        item_names.append(name_el.inner_text().strip())
+
+    print(f"[정보] {n_top}개 품목을 순회하며 다운로드합니다 (품목당 수출금액+단가 2회 다운로드, 하위 기업 있으면 추가).")
+
+    item_records: list[dict] = []
+    company_records: list[dict] = []
     n_done = 0
-    for i in range(n_rows):
-        row = item_rows.nth(i)
-        name_span = row.locator(".group__item__name")
-        item_name = name_span.first.inner_text().strip() if name_span.count() > 0 else ""
+    n_with_companies = 0
+    for i, item_name in enumerate(item_names):
         if not item_name:
             continue
 
-        print(f"[{i + 1}/{n_rows}] {item_name} 다운로드 중...")
+        # 펼치기로 새 행이 삽입되며 인덱스가 계속 밀리므로 매번 품목명으로 다시 찾는다
+        # (인덱스 고정 가정 금지).
+        row = body.locator(".label__columns table tbody tr").filter(
+            has=page.locator(".group__item__name.main-text", has_text=item_name)
+        ).first
+        if row.count() == 0:
+            print(f"[경고] {item_name}: 행을 다시 찾지 못해 건너뜁니다.")
+            continue
+
+        print(f"[{i + 1}/{n_top}] {item_name} 다운로드 중...")
+        row.scroll_into_view_if_needed()
         try:
             _open_item_modal(page, row)
             modal = page.locator(".hs-codes-chart-modal")
@@ -347,7 +434,7 @@ def scrape_all_items(page) -> list[dict]:
         price_by_date = dict(zip(price_month["date"], price_month["value"]))
 
         for _, r in export_month.iterrows():
-            all_records.append(
+            item_records.append(
                 {
                     "품목명": item_name,
                     "기준일": r["date"].strftime("%Y-%m-%d"),
@@ -361,75 +448,11 @@ def scrape_all_items(page) -> list[dict]:
         latest_month = export_month.iloc[-1]["date"].strftime("%Y-%m")
         print(f"  -> {len(export_month)}개월치 확보 (2016년~{latest_month})")
 
-    print(f"[정보] {n_done}/{n_rows}개 품목, 총 {len(all_records)}개 레코드 추출.")
-    if n_done == 0:
-        raise RuntimeError("품목을 하나도 처리하지 못했습니다. 위 경고 메시지와 .auth/debug 폴더를 확인해주세요.")
-    return all_records
-
-
-# ---------- 품목 및 지역 커스텀 설정: 하위 기업(지역) 순회 ----------
-def _ensure_row_expanded(page, row) -> None:
-    """품목 행의 펼침 아이콘(svg polyline)이 '접힘' 좌표면 클릭해서 펼친다.
-    이미 펼쳐져 있으면 아무것도 하지 않는다 (잘못 클릭하면 오히려 접혀버리므로)."""
-    polyline = row.locator(".expand__group svg polyline").first
-    if polyline.count() == 0:
-        return
-    points = (polyline.get_attribute("points") or "").strip()
-    if points == COLLAPSED_POLYLINE_POINTS:
-        row.locator(".expand__group svg").first.click(timeout=5000, force=True)
-        page.wait_for_timeout(500)
-
-
-def scrape_company_breakdowns(page) -> list[dict]:
-    """"품목 및 지역 커스텀 설정" 화면에서, 하위에 기업(지역) 행이 실제로 설정된
-    품목만 골라 기업별 수출금액/단가 전체 히스토리를 수집한다.
-
-    한 품목에 하위 기업이 있는지는 펼치기 전에는 알 수 없다 (화면 기본 접힘/펼침
-    상태와 무관 - probe_expand_full.py로 실제 확인함: IC칩처럼 접힌 채로 보이는
-    품목도 펼치면 하위 기업이 나오는 경우가 있었다). 그래서 전체 품목을 순서대로
-    펼쳐본 뒤, 펼친 직후 바로 다음에 tr-{부모}-{자식} 형태의 행이 있으면(=번호가
-    매겨진 실제 기업 행) 그것만 채택하고, "+지역 추가" placeholder만 있으면
-    건너뛴다. 특정 품목명을 하드코딩하지 않는다 - 품목 커스텀 설정은 계속
-    추가될 수 있기 때문.
-    """
-    ensure_region_data_ready(page)
-    body = page.locator(f"{GRID_SELECTOR}__body")
-
-    # .group__item__name.main-text가 있는 행만 상위 품목 행이다 (하위 기업 행은
-    # .group__item__name.sub-text, placeholder 행은 .group__item__name__option을 쓴다 -
-    # probe_expand_ccl.py/probe_expand_full.py로 실제 DOM 확인함). 텍스트("전체" 접두어)
-    # 매칭 대신 클래스로 구분해야 Playwright의 텍스트 정규화 이슈를 피할 수 있다
-    # (2026-07-07: has_text 정규식 앵커가 실제로는 매칭되지 않는 문제를 겪음).
-    top_rows = body.locator(".label__columns table tbody tr").filter(has=page.locator(".group__item__name.main-text"))
-    n_top = top_rows.count()
-    if n_top == 0:
-        _dump_debug(page, "no_region_rows_found")
-        raise RuntimeError("품목 및 지역 커스텀 설정 화면에서 품목 행을 찾지 못했습니다. .auth/debug 폴더를 확인해주세요.")
-
-    item_names = []
-    for i in range(n_top):
-        name_el = top_rows.nth(i).locator(".group__item__name.main-text").first
-        item_names.append(name_el.inner_text().strip())
-
-    print(f"[정보] 품목 및 지역 커스텀 설정: {n_top}개 품목의 하위 기업 여부를 확인합니다.")
-
-    all_records: list[dict] = []
-    n_with_companies = 0
-    for i, item_name in enumerate(item_names):
-        # 이전 품목들을 펼치면서 새 행이 앞쪽에 삽입돼 인덱스가 계속 밀리므로,
-        # 매번 품목명으로 다시 찾는다 (인덱스 고정 가정 금지).
-        row = body.locator(".label__columns table tbody tr").filter(
-            has=page.locator(".group__item__name.main-text", has_text=item_name)
-        ).first
-        if row.count() == 0:
-            print(f"[경고] {item_name}: 행을 다시 찾지 못해 건너뜁니다.")
-            continue
-
-        row.scroll_into_view_if_needed()
+        # 같은 행에서 이어서 하위 기업(지역) 펼치기 시도
         try:
             _ensure_row_expanded(page, row)
         except PWTimeoutError:
-            print(f"[경고] {item_name}: 펼치기 실패, 건너뜁니다.")
+            print(f"  [경고] {item_name}: 하위 기업 펼치기 실패, 건너뜁니다.")
             continue
 
         children = row.evaluate(CHILD_ROW_WALK_JS)
@@ -437,7 +460,7 @@ def scrape_company_breakdowns(page) -> list[dict]:
             continue
 
         n_with_companies += 1
-        print(f"[{i + 1}/{n_top}] {item_name}: 하위 기업 {len(children)}개 발견")
+        print(f"  -> 하위 기업 {len(children)}개 발견")
         for child in children:
             company_name = (child.get("companyName") or "").strip()
             class_name = child.get("className")
@@ -470,7 +493,7 @@ def scrape_company_breakdowns(page) -> list[dict]:
             price_by_date = dict(zip(price_month["date"], price_month["value"]))
 
             for _, r in export_month.iterrows():
-                all_records.append(
+                company_records.append(
                     {
                         "품목명": item_name,
                         "기업명": company_name,
@@ -481,10 +504,12 @@ def scrape_company_breakdowns(page) -> list[dict]:
                 )
 
     print(
-        f"[정보] 하위 기업 보유 품목 {n_with_companies}/{n_top}개, "
-        f"총 {len(all_records)}개 기업x월 레코드 추출."
+        f"[정보] {n_done}/{n_top}개 품목 처리, 총 {len(item_records)}개 품목 레코드. "
+        f"하위 기업 보유 품목 {n_with_companies}개, 총 {len(company_records)}개 기업x월 레코드 추출."
     )
-    return all_records
+    if n_done == 0:
+        raise RuntimeError("품목을 하나도 처리하지 못했습니다. 위 경고 메시지와 .auth/debug 폴더를 확인해주세요.")
+    return item_records, company_records
 
 
 def main() -> None:
@@ -498,10 +523,7 @@ def main() -> None:
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            ensure_data_ready(page)
-            records = scrape_all_items(page)
-
-            company_records = scrape_company_breakdowns(page)
+            records, company_records = scrape_items_and_companies(page)
         finally:
             context.close()
 
