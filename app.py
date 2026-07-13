@@ -306,6 +306,10 @@ if "chart_period" not in st.session_state:
     st.session_state.chart_period = "5Y"
 if "items_view_mode" not in st.session_state:
     st.session_state.items_view_mode = "테이블형"
+if "decade_view_mode" not in st.session_state:
+    st.session_state.decade_view_mode = "10/20일별"
+if "decade_chart_period" not in st.session_state:
+    st.session_state.decade_chart_period = "5Y"
 
 
 # ---------- 딥링크 수신 (?hs=<HS코드>, ?category=<카테고리명>) ----------
@@ -1289,6 +1293,39 @@ def render_items_decade() -> None:
     render_items_decade_table(view)
 
 
+def _render_decade_kpi_cards(latest: pd.Series) -> None:
+    yoy_txt, yoy_color = _fmt_pct_color(latest["yoy"])
+    chg_txt, chg_color = _fmt_pct_color(latest["prev_change_pct"])
+    price_txt, price_color = _fmt_pct_color(latest.get("price_yoy"))
+    unit_price = latest.get("unit_price")
+
+    cards = [
+        ("최신 수출금액", f'<span style="color:{TEXT_MAIN};">{_fmt_amount(latest["export_amount"])}</span>'),
+        ("YoY (전년 동순)", f'<span style="color:{yoy_color};">{yoy_txt}</span>'),
+        ("갱신 대비", f'<span style="color:{chg_color};">{chg_txt}</span>'),
+        ("단가", f'<span style="color:{TEXT_MAIN};">{_fmt_amount(unit_price) if pd.notna(unit_price) else "N/A"}</span>'),
+        ("단가 YoY", f'<span style="color:{price_color};">{price_txt}</span>'),
+    ]
+    cols = st.columns(len(cards))
+    for col, (label, value_html) in zip(cols, cards):
+        with col:
+            st.markdown(
+                f"""
+                <div class="kpi-card">
+                  <div class="kpi-card-value kpi-card-value--sm">{value_html}</div>
+                  <div class="kpi-card-label">{label}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def _decade_monthly_rollup(hist: pd.DataFrame) -> pd.DataFrame:
+    """10일/20일/월말 스냅샷 중 각 달의 마지막 스냅샷만 남겨 월별로 묶어본다
+    (진행 중인 달은 그 달의 최신 스냅샷이 그대로 마지막 값이 된다)."""
+    return hist.sort_values("date").groupby(hist["date"].dt.to_period("M"), as_index=False).tail(1).reset_index(drop=True)
+
+
 def render_decade_detail(item_name: str) -> None:
     if st.button("← 목록으로", key="decade_back"):
         st.session_state.selected_decade_item = None
@@ -1300,41 +1337,92 @@ def render_decade_detail(item_name: str) -> None:
         return
     latest = hist.iloc[-1]
 
+    # 1. 상단 정보
+    hs = get_hs_code(mapping_df, item_name)
     companies = get_related_companies(mapping_df, item_name)
     st.subheader(item_name)
-    meta_lines = [f'<div><span style="font-weight:600;">기준일:</span> {latest["date"].strftime("%Y-%m-%d")} · 잠정치</div>']
+    meta_lines = [f'<div><span style="font-weight:600;">HS코드:</span> {hs or "미매핑"}</div>']
     if companies:
         meta_lines.append(f'<div><span style="font-weight:600;">관련 기업:</span> {", ".join(companies)}</div>')
+    meta_lines.append(
+        f'<div><span style="font-weight:600;">최신 기준일:</span> {latest["date"].strftime("%Y-%m-%d")} · 잠정치</div>'
+    )
     st.markdown(
         f'<div style="color:{TEXT_MAIN};font-size:13.5px;line-height:1.7;margin:4px 0 10px;">'
         + "".join(meta_lines) + '</div>',
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("최신 수출금액", _fmt_amount(latest["export_amount"]))
-    c2.metric("YoY (전년 동순)", _fmt_pct_text(latest["yoy"]))
-    c3.metric("갱신 대비", _fmt_pct_text(latest["prev_change_pct"]))
+    # 2. KPI 카드
+    _render_decade_kpi_cards(latest)
+
+    # 3. 투자 해석 박스 (월간 상세와 동일한 문구 생성 로직 재사용 - ma3_yoy/volume_yoy가
+    # 없는 필드는 함수 내부에서 자동으로 생략됨)
+    st.markdown(
+        f"""<div style="background:{ACTIVE_BG};border:1px solid {ACCENT};border-radius:8px;
+        padding:12px 16px;margin:10px 0;color:{ACCENT_DARK};font-size:13.5px;line-height:1.5;">
+        💬 {generate_detail_commentary(latest, companies)}
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # 4. 관련 기업 테이블 (월간 상세와 동일한 테이블 재사용 - 실측 데이터는
+    # company_trade_history_long.csv 기준 월간치만 있어, 있는 품목은 월간 실측값이,
+    # 없는 품목은 참고용 매핑만 표시된다)
+    company_metrics_df = _load_company_with_metrics()
+    render_related_company_table(item_name, latest["export_amount"], company_metrics_df)
 
     has_price = hist["unit_price"].notna().any() if "unit_price" in hist.columns else False
 
-    st.markdown("###### 수출금액 추이 (10일/20일/월말)")
-    fig = go.Figure(go.Bar(x=hist["date"], y=hist["export_amount"], marker_color=ACCENT, name="수출금액"))
+    # 5. 차트 - 10/20일별 원본 vs 월별로 묶어보기(각 달의 마지막 스냅샷만) 토글
+    view_mode = st.segmented_control("보기", ["10/20일별", "월별로 묶어보기"], key="decade_view_mode")
+    st.segmented_control("기간", CHART_PERIOD_OPTIONS, key="decade_chart_period")
+    chart_hist = _decade_monthly_rollup(hist) if view_mode == "월별로 묶어보기" else hist
+    chart_hist = _filter_by_period(chart_hist, st.session_state.decade_chart_period)
+
+    st.markdown("###### 수출금액 추이")
+    fig = go.Figure(go.Bar(x=chart_hist["date"], y=chart_hist["export_amount"], marker_color=ACCENT, name="수출금액"))
     fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig, width="stretch")
 
     if has_price:
         st.markdown("###### 단가 추이")
         price_fig = go.Figure(
-            go.Scatter(x=hist["date"], y=hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가")
+            go.Scatter(
+                x=chart_hist["date"], y=chart_hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가"
+            )
         )
         price_fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(price_fig, width="stretch")
 
+    st.markdown("###### 보조 지표")
+    yc, cc = st.columns(2)
+    with yc:
+        yoy_fig = go.Figure(
+            go.Scatter(x=chart_hist["date"], y=chart_hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY")
+        )
+        yoy_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출금액 YoY(%, 전년 동순 대비)", margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(yoy_fig, width="stretch")
+    with cc:
+        chg_fig = go.Figure(
+            go.Scatter(x=chart_hist["date"], y=chart_hist["prev_change_pct"], mode="lines+markers", line=dict(color=WARNING), name="갱신 대비")
+        )
+        chg_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="갱신 대비 증감(%)", margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(chg_fig, width="stretch")
+
+    if has_price and chart_hist["price_yoy"].notna().any():
+        st.markdown("###### 단가 YoY")
+        pfig = go.Figure(
+            go.Scatter(x=chart_hist["date"], y=chart_hist["price_yoy"], mode="lines+markers", line=dict(color=PRICE_COLOR), name="단가 YoY")
+        )
+        pfig.update_layout(template=PLOTLY_TEMPLATE, height=270, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(pfig, width="stretch")
+
+    # 6. 원자료 테이블
     with st.expander("원자료 테이블 보기"):
         raw_cols = ["date", "export_amount", "unit_price", "prev_change_pct", "yoy", "price_yoy"]
-        raw_cols = [c for c in raw_cols if c in hist.columns]
-        raw_display = hist[raw_cols].sort_values("date", ascending=False).copy()
+        raw_cols = [c for c in raw_cols if c in chart_hist.columns]
+        raw_display = chart_hist[raw_cols].sort_values("date", ascending=False).copy()
         raw_display.rename(
             columns={
                 "date": "기준일", "export_amount": "수출금액", "unit_price": "단가",
