@@ -1,0 +1,8 @@
+# 로컬 스크래핑 전용 (scrape_bigfinance.py, scrape_bigfinance_items.py,
+# import_item_mapping.py 등). Streamlit Cloud에 배포되는 app.py는 이 패키지들을
+# 쓰지 않으므로 requirements.txt(배포용)에는 넣지 않는다 - playwright는 특히
+# 무거워서 배포 컨테이너의 메모리/빌드 부담만 키운다.
+-r requirements.txt
+playwright>=1.44
+openpyxl>=3.1
+python-dotenv>=1.0

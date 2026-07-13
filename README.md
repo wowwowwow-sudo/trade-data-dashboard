@@ -8,6 +8,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+`requirements.txt`는 배포되는 대시보드(app.py)가 실제로 쓰는 패키지만 담는다
+(streamlit/pandas/numpy/plotly). Streamlit Cloud 무료 티어는 메모리가 넉넉하지
+않아, playwright처럼 무거운 스크래핑 전용 패키지를 여기 섞으면 안 된다. 로컬에서
+스크래핑 스크립트(`scrape_bigfinance.py`, `scrape_bigfinance_items.py`,
+`import_item_mapping.py`)를 돌리려면:
+```
+pip install -r requirements-scrape.txt
+```
+
 ## 데이터 갱신
 1. bigfinance.co.kr에 로그인 후 "잠정 수출 품목 리스트" 화면 확인
 2. 새 값을 `append_snapshot.py`의 `append_snapshot()`에 넘겨서 실행
