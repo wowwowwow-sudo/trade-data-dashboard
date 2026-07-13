@@ -43,6 +43,11 @@ def append_snapshot(records: list[dict]) -> pd.DataFrame:
         history = pd.DataFrame(columns=list(required))
 
     combined = pd.concat([history, new_df], ignore_index=True)
+    # 기준일을 월말로 정규화한 뒤 dedup한다 - 그렇지 않으면 "월 1일"과 "월말"처럼
+    # 같은 달을 가리키는 서로 다른 날짜 문자열이 별개 행으로 남아 한 달에 행이
+    # 2개씩 쌓이는 문제가 생긴다 (2017~2025 데이터에서 실제로 발생했던 버그).
+    combined["기준일"] = pd.to_datetime(combined["기준일"]) + pd.offsets.MonthEnd(0)
+    combined["기준일"] = combined["기준일"].dt.strftime("%Y-%m-%d")
     combined = combined.drop_duplicates(subset=["품목명", "기준일"], keep="last")
     combined = combined.sort_values(["품목명", "기준일"]).reset_index(drop=True)
     combined.to_csv(HISTORY_PATH, index=False)
