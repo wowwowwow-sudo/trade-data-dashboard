@@ -307,7 +307,7 @@ if "chart_period" not in st.session_state:
 if "items_view_mode" not in st.session_state:
     st.session_state.items_view_mode = "테이블형"
 if "decade_view_mode" not in st.session_state:
-    st.session_state.decade_view_mode = "10/20일별"
+    st.session_state.decade_view_mode = "월별로 묶어보기"
 if "decade_chart_period" not in st.session_state:
     st.session_state.decade_chart_period = "5Y"
 
@@ -1037,17 +1037,6 @@ def render_detail(item_name: str) -> None:
         else:
             st.caption("단가 데이터가 없어 생략합니다.")
 
-        st.markdown("###### 3개월 이동평균")
-        fig_ma = go.Figure()
-        fig_ma.add_trace(go.Bar(x=hist["date"], y=hist["export_amount"], marker_color="#DBEAFE", name="월별 수출금액"))
-        fig_ma.add_trace(
-            go.Scatter(x=hist["date"], y=hist["ma3_amount"], mode="lines", line=dict(color=WARNING, width=2), name="3개월 이동평균")
-        )
-        fig_ma.update_layout(
-            template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12)
-        )
-        st.plotly_chart(fig_ma, width="stretch")
-
         # 보조 차트 - 하단 2열 그리드 (좁으면 자동 1열)
         st.markdown("###### 보조 지표")
         yc, mc = st.columns(2)
@@ -1326,6 +1315,26 @@ def _decade_monthly_rollup(hist: pd.DataFrame) -> pd.DataFrame:
     return hist.sort_values("date").groupby(hist["date"].dt.to_period("M"), as_index=False).tail(1).reset_index(drop=True)
 
 
+DECADE_SEGMENT_LABELS = {1: "상순", 2: "중순", 3: "하순"}
+
+
+def _decade_stacked_segments(hist: pd.DataFrame) -> pd.DataFrame:
+    """상순/중순/하순 누적 스냅샷을 구간별 증분(그 구간에서 새로 늘어난 양)으로 분해해,
+    한 달 = 막대 하나에 상순/중순/하순이 색깔별로 쌓이는 스택형 막대 차트용 데이터를 만든다.
+    실제 보고일이 공휴일 등으로 며칠 밀려도 흔들리지 않도록 달력 날짜가 아니라 그 달의
+    몇 번째 스냅샷인지(occ_in_month, compute_decade_item_metrics에서 계산됨)로 구간을 나눈다."""
+    g = hist.sort_values("date").copy()
+    g["month"] = g["date"].dt.to_period("M")
+    g["prev_in_month"] = g.groupby("month")["export_amount"].shift(1)
+    g["increment"] = g["export_amount"] - g["prev_in_month"].fillna(0)
+
+    wide = g.pivot_table(index="month", columns="occ_in_month", values="increment", aggfunc="last")
+    wide = wide.rename(columns=DECADE_SEGMENT_LABELS)
+    wide = wide.reset_index()
+    wide["date"] = wide["month"].dt.to_timestamp() + pd.offsets.MonthEnd(0)
+    return wide.drop(columns="month")
+
+
 def render_decade_detail(item_name: str) -> None:
     if st.button("← 목록으로", key="decade_back"):
         st.session_state.selected_decade_item = None
@@ -1374,15 +1383,27 @@ def render_decade_detail(item_name: str) -> None:
 
     has_price = hist["unit_price"].notna().any() if "unit_price" in hist.columns else False
 
-    # 5. 차트 - 10/20일별 원본 vs 월별로 묶어보기(각 달의 마지막 스냅샷만) 토글
+    # 5. 차트 - 10/20일별 원본 vs 월별로 묶어보기(상순/중순/하순 증분을 쌓은 스택 막대) 토글
     view_mode = st.segmented_control("보기", ["10/20일별", "월별로 묶어보기"], key="decade_view_mode")
     st.segmented_control("기간", CHART_PERIOD_OPTIONS, key="decade_chart_period")
+    period = st.session_state.decade_chart_period
     chart_hist = _decade_monthly_rollup(hist) if view_mode == "월별로 묶어보기" else hist
-    chart_hist = _filter_by_period(chart_hist, st.session_state.decade_chart_period)
+    chart_hist = _filter_by_period(chart_hist, period)
 
     st.markdown("###### 수출금액 추이")
-    fig = go.Figure(go.Bar(x=chart_hist["date"], y=chart_hist["export_amount"], marker_color=ACCENT, name="수출금액"))
-    fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
+    if view_mode == "월별로 묶어보기":
+        stacked = _decade_stacked_segments(_filter_by_period(hist, period))
+        fig = go.Figure()
+        for label, color in zip(["상순", "중순", "하순"], (ACCENT, VOLUME_COLOR, WARNING)):
+            if label in stacked.columns:
+                fig.add_trace(go.Bar(x=stacked["date"], y=stacked[label], name=label, marker_color=color))
+        fig.update_layout(
+            barmode="stack", template=PLOTLY_TEMPLATE, height=340,
+            margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h", y=1.12),
+        )
+    else:
+        fig = go.Figure(go.Bar(x=chart_hist["date"], y=chart_hist["export_amount"], marker_color=ACCENT, name="수출금액"))
+        fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
     st.plotly_chart(fig, width="stretch")
 
     if has_price:
@@ -1395,20 +1416,16 @@ def render_decade_detail(item_name: str) -> None:
         price_fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(price_fig, width="stretch")
 
+    # "갱신 대비"(직전 스냅샷 대비 증감)는 상순/중순/하순처럼 월중 누적값이 매달 리셋되는
+    # 지점을 그대로 이어붙여 비교하는 지표라, 데이터가 얼마나 쌓여도 월초에 급락 -> 월중
+    # 급등을 반복하는 톱니 패턴이 구조적으로 나온다 (특정 달의 부분 데이터 문제가 아님).
+    # 시계열 차트로는 의미가 없어 최신값 KPI 카드/원자료 표에만 남기고 추이 차트는 뺀다.
     st.markdown("###### 보조 지표")
-    yc, cc = st.columns(2)
-    with yc:
-        yoy_fig = go.Figure(
-            go.Scatter(x=chart_hist["date"], y=chart_hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY")
-        )
-        yoy_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출금액 YoY(%, 전년 동순 대비)", margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(yoy_fig, width="stretch")
-    with cc:
-        chg_fig = go.Figure(
-            go.Scatter(x=chart_hist["date"], y=chart_hist["prev_change_pct"], mode="lines+markers", line=dict(color=WARNING), name="갱신 대비")
-        )
-        chg_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="갱신 대비 증감(%)", margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(chg_fig, width="stretch")
+    yoy_fig = go.Figure(
+        go.Scatter(x=chart_hist["date"], y=chart_hist["yoy"], mode="lines+markers", line=dict(color=POSITIVE), name="YoY")
+    )
+    yoy_fig.update_layout(template=PLOTLY_TEMPLATE, height=270, title="수출금액 YoY(%, 전년 동순 대비)", margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(yoy_fig, width="stretch")
 
     if has_price and chart_hist["price_yoy"].notna().any():
         st.markdown("###### 단가 YoY")

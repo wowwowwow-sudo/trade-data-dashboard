@@ -3,13 +3,17 @@
 
 기존 run_pipeline.bat와의 차이:
   - 시작 전 git pull --ff-only로 원격 변경사항을 먼저 받는다 (실패 시 중단)
-  - trade_history_long.csv / company_trade_history_long.csv 원본 데이터도
-    data/interlink와 함께 commit/push한다 (run_pipeline.bat는 interlink만 push해서
-    원본 CSV 갱신이 로컬에만 쌓이고 원격에 반영되지 않는 문제가 있었음)
+  - trade_history_long.csv / trade_history_decade_long.csv / company_trade_history_long.csv
+    원본 데이터도 data/interlink와 함께 commit/push한다 (run_pipeline.bat는 interlink만
+    push해서 원본 CSV 갱신이 로컬에만 쌓이고 원격에 반영되지 않는 문제가 있었음)
   - push가 경합(원격이 앞서 있음)으로 거절되면 pull --rebase 후 1회만 재시도한다
 
-순서: git pull --ff-only -> scrape_bigfinance.py -> scripts/export_interlink.py
-     -> 변경 있으면 데이터 파일만 git add -> commit -> push (실패 시 rebase 후 재시도 1회)
+순서: git pull --ff-only -> scrape_bigfinance.py -> scrape_bigfinance_items.py
+     -> scripts/export_interlink.py -> 변경 있으면 데이터 파일만 git add -> commit -> push
+     (실패 시 rebase 후 재시도 1회)
+
+주의: scrape_bigfinance_items.py는 아직 스케줄러 자동 실행에 안 넣었다 - 당분간은
+수동으로 python run_update.py를 돌려서 안정화된 뒤에 스케줄러에 등록할 예정.
 
 실행: python run_update.py
 스케줄러 태스크(BigFinance_TradeScrape)가 run_pipeline.bat 대신 이 스크립트를
@@ -30,6 +34,7 @@ BASE_DIR = Path(__file__).parent
 
 DATA_PATHS = [
     "trade_history_long.csv",
+    "trade_history_decade_long.csv",
     "company_trade_history_long.csv",
     "data/interlink",
 ]
@@ -108,6 +113,9 @@ def main() -> int:
         return 1
 
     if not run_script("scrape_bigfinance.py"):
+        return 1
+
+    if not run_script("scrape_bigfinance_items.py"):
         return 1
 
     if not run_script("scripts/export_interlink.py"):
