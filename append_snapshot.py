@@ -16,6 +16,7 @@ import pandas as pd
 
 HISTORY_PATH = Path(__file__).parent / "trade_history_long.csv"
 COMPANY_HISTORY_PATH = Path(__file__).parent / "company_trade_history_long.csv"
+DECADE_HISTORY_PATH = Path(__file__).parent / "trade_history_decade_long.csv"
 
 
 def append_snapshot(records: list[dict]) -> pd.DataFrame:
@@ -79,6 +80,42 @@ def append_company_snapshot(records: list[dict]) -> pd.DataFrame:
     combined.to_csv(COMPANY_HISTORY_PATH, index=False)
     n_pairs = combined.drop_duplicates(subset=["품목명", "기업명"]).shape[0]
     print(f"저장 완료: {COMPANY_HISTORY_PATH} (총 {len(combined)}행, {n_pairs}개 품목-기업 조합)")
+    return combined
+
+
+def append_decade_snapshot(records: list[dict]) -> pd.DataFrame:
+    """
+    trade_history_decade_long.csv에 새 스냅샷을 누적한다. append_snapshot()과 같은 upsert
+    방식(품목명/기준일 키로 최신 값 우선)이지만, "품목 커스텀 설정" 화면에서 받은 값은
+    월말로 collapse하지 않고 10일/20일/월말 스냅샷을 그대로 다 남긴다 - 그래서 한 품목당
+    한 달에 여러 행이 쌓일 수 있다(append_snapshot()의 trade_history_long.csv는 월 1행).
+
+    records 예시:
+    [
+        {"품목명": "반도체_메모리", "기준일": "2026-07-10",
+         "수출금액": 9800000000, "단가": 78500.0},
+    ]
+    """
+    new_df = pd.DataFrame(records)
+    if "대분류" not in new_df.columns or new_df["대분류"].isna().any():
+        auto = new_df["품목명"].str.split("_").str[0]
+        new_df["대분류"] = new_df["대분류"].fillna(auto) if "대분류" in new_df else auto
+
+    required = {"품목명", "대분류", "기준일", "수출금액", "단가"}
+    missing = required - set(new_df.columns)
+    if missing:
+        raise ValueError(f"records에 컬럼이 빠졌습니다: {missing}")
+
+    if DECADE_HISTORY_PATH.exists():
+        history = pd.read_csv(DECADE_HISTORY_PATH)
+    else:
+        history = pd.DataFrame(columns=list(required))
+
+    combined = pd.concat([history, new_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["품목명", "기준일"], keep="last")
+    combined = combined.sort_values(["품목명", "기준일"]).reset_index(drop=True)
+    combined.to_csv(DECADE_HISTORY_PATH, index=False)
+    print(f"저장 완료: {DECADE_HISTORY_PATH} (총 {len(combined)}행, {combined['품목명'].nunique()}개 품목)")
     return combined
 
 

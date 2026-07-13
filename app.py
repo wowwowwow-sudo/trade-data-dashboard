@@ -30,6 +30,7 @@ from utils_data import (
     build_related_company_table,
     classify_alert_reason,
     compute_company_metrics,
+    compute_decade_item_metrics,
     compute_item_metrics,
     enrich_signal_board,
     generate_detail_commentary,
@@ -42,6 +43,7 @@ from utils_data import (
     get_related_companies,
     get_top_n,
     load_company_history,
+    load_decade_history,
     load_favorites,
     load_history,
     load_item_mapping,
@@ -73,6 +75,7 @@ ACTIVE_BORDER = "#2563EB"
 PLOTLY_TEMPLATE = "plotly_white"
 
 SCRAPER_PATH = BASE_DIR / "scrape_bigfinance.py"
+SCRAPER_ITEMS_PATH = BASE_DIR / "scrape_bigfinance_items.py"
 PAGE_SIZE_STEP = 12
 TOP_CARD_COUNT = 8
 CARD_COLS = 4
@@ -216,6 +219,17 @@ def _load_company_with_metrics() -> pd.DataFrame:
     return compute_company_metrics(df)
 
 
+@st.cache_data
+def _load_decade() -> pd.DataFrame:
+    return load_decade_history()
+
+
+@st.cache_data
+def _load_decade_with_metrics() -> pd.DataFrame:
+    df = _load_decade()
+    return compute_decade_item_metrics(df)
+
+
 # ---------- 포맷 헬퍼 ----------
 def _fmt_amount(v) -> str:
     """원자료/상세페이지용 - 원래 숫자 그대로."""
@@ -263,6 +277,15 @@ enriched_df = enrich_signal_board(latest_df)  # Signal Score/해석 태그 - 투
 missing_items = get_missing_items(history_df, mapping_df)
 data_status = get_data_status(history_df, missing_items)
 
+# "품목 커스텀 설정"(10일 단위) - scrape_bigfinance_items.py를 아직 안 돌렸으면 빈 DataFrame이고,
+# 이는 정상 상태이므로 앱을 막지 않는다(company 데이터와 동일한 방침).
+decade_metrics_df = _load_decade_with_metrics()
+decade_latest_df = (
+    decade_metrics_df.sort_values("date").groupby("item_name", as_index=False).tail(1)
+    if not decade_metrics_df.empty
+    else decade_metrics_df
+)
+
 if "favorites" not in st.session_state:
     st.session_state.favorites = load_favorites()
 if "view" not in st.session_state:
@@ -271,6 +294,8 @@ if "selected_item" not in st.session_state:
     st.session_state.selected_item = None
 if "selected_company" not in st.session_state:
     st.session_state.selected_company = None  # (item_name, company_name) 튜플 또는 None
+if "selected_decade_item" not in st.session_state:
+    st.session_state.selected_decade_item = None  # "품목 커스텀 설정"(10일 단위) 상세 화면용
 if "page_size" not in st.session_state:
     st.session_state.page_size = PAGE_SIZE_STEP
 if "selected_category" not in st.session_state:
@@ -1175,6 +1200,151 @@ def render_company_detail(item_name: str, company_name: str) -> None:
     st.dataframe(raw_display, hide_index=True, width="stretch")
 
 
+# ---------- "품목 커스텀 설정" (10일 단위 - 상순/중순/하순) ----------
+def _decade_table_display_df(view: pd.DataFrame) -> pd.DataFrame:
+    has_price = "unit_price" in view.columns
+    return pd.DataFrame(
+        {
+            "품목": view["item_name"].values,
+            "섹터": view["category"].values,
+            "기준일": view["date"].dt.strftime("%Y-%m-%d").values,
+            "최신 수출액": [_fmt_amount_abbr(v) for v in view["export_amount"]],
+            "YoY": [_fmt_pct_text(v) for v in view["yoy"]],
+            "갱신 대비": [_fmt_pct_text(v) for v in view["prev_change_pct"]],
+            "단가": [_fmt_amount(v) for v in view["unit_price"]] if has_price else ["–"] * len(view),
+            "단가 YoY": [_fmt_pct_text(v) for v in view["price_yoy"]],
+            "관련 기업": [_related_companies_str(n) or "–" for n in view["item_name"]],
+        }
+    )
+
+
+def render_items_decade_table(view: pd.DataFrame) -> None:
+    display = _decade_table_display_df(view)
+    pct_cols = ["YoY", "갱신 대비", "단가 YoY"]
+    styler = display.style.map(_pct_text_color, subset=pct_cols)
+    event = st.dataframe(
+        styler, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="items_decade_table"
+    )
+    selection = getattr(event, "selection", None) or (event.get("selection") if isinstance(event, dict) else None)
+    rows = (selection or {}).get("rows") if selection else None
+    if rows:
+        st.session_state.selected_decade_item = view.iloc[rows[0]]["item_name"]
+        st.rerun()
+
+
+def render_items_decade() -> None:
+    st.subheader("품목 커스텀 설정 (10일 단위)")
+    st.caption("EPIC Finance \"품목 커스텀 설정\" 화면 기준 - 상순/중순/하순 갱신마다 반영됩니다.")
+
+    if decade_latest_df.empty:
+        st.info(
+            "아직 수집된 데이터가 없습니다. 왼쪽 사이드바 \"설정\"에서 "
+            "\"품목 데이터 갱신 (10일)\"을 먼저 실행해주세요."
+        )
+        return
+
+    search = st.text_input(
+        "품목명/기업명 검색...", label_visibility="collapsed", placeholder="품목명 또는 기업명 검색...", key="decade_search"
+    )
+
+    categories = get_categories(mapping_df, decade_latest_df)
+    category_options = ["전체"] + categories
+    cols_per_row = 6
+    cat_rows = [category_options[i : i + cols_per_row] for i in range(0, len(category_options), cols_per_row)]
+    with st.container(key="decade_category_filter_row"):
+        for row in cat_rows:
+            cols = st.columns(len(row))
+            for col, cat in zip(cols, row):
+                is_selected = st.session_state.get("decade_selected_category", "전체") == cat
+                if col.button(cat, key=f"decade_cat_{cat}", type="primary" if is_selected else "secondary", width="stretch"):
+                    st.session_state.decade_selected_category = cat
+                    st.rerun()
+
+    sort_key = st.selectbox("정렬", ["수출액순", "YoY순", "갱신 대비순", "이름순"], label_visibility="collapsed", key="decade_sort")
+
+    view = decade_latest_df.copy()
+    selected_category = st.session_state.get("decade_selected_category", "전체")
+    if selected_category != "전체":
+        view = view[view["category"] == selected_category]
+
+    if search:
+        company_match = view["item_name"].apply(lambda n: search.lower() in _related_companies_str(n).lower())
+        name_match = view["item_name"].str.contains(search, case=False, na=False)
+        view = view[name_match | company_match]
+
+    sort_map = {
+        "수출액순": ("export_amount", False),
+        "YoY순": ("yoy", False),
+        "갱신 대비순": ("prev_change_pct", False),
+        "이름순": ("item_name", True),
+    }
+    sort_col, sort_asc = sort_map[sort_key]
+    view = view.sort_values(sort_col, ascending=sort_asc, na_position="last")
+
+    st.caption(f"{len(view)}개 품목 · 최신 기준일 {view['date'].max().strftime('%Y-%m-%d')}")
+    if view.empty:
+        st.info("조건에 맞는 품목이 없습니다.")
+        return
+
+    render_items_decade_table(view)
+
+
+def render_decade_detail(item_name: str) -> None:
+    if st.button("← 목록으로", key="decade_back"):
+        st.session_state.selected_decade_item = None
+        st.rerun()
+
+    hist = decade_metrics_df[decade_metrics_df["item_name"] == item_name].sort_values("date")
+    if hist.empty:
+        st.warning("이 품목의 데이터가 없습니다.")
+        return
+    latest = hist.iloc[-1]
+
+    companies = get_related_companies(mapping_df, item_name)
+    st.subheader(item_name)
+    meta_lines = [f'<div><span style="font-weight:600;">기준일:</span> {latest["date"].strftime("%Y-%m-%d")} · 잠정치</div>']
+    if companies:
+        meta_lines.append(f'<div><span style="font-weight:600;">관련 기업:</span> {", ".join(companies)}</div>')
+    st.markdown(
+        f'<div style="color:{TEXT_MAIN};font-size:13.5px;line-height:1.7;margin:4px 0 10px;">'
+        + "".join(meta_lines) + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("최신 수출금액", _fmt_amount(latest["export_amount"]))
+    c2.metric("YoY (전년 동순)", _fmt_pct_text(latest["yoy"]))
+    c3.metric("갱신 대비", _fmt_pct_text(latest["prev_change_pct"]))
+
+    has_price = hist["unit_price"].notna().any() if "unit_price" in hist.columns else False
+
+    st.markdown("###### 수출금액 추이 (10일/20일/월말)")
+    fig = go.Figure(go.Bar(x=hist["date"], y=hist["export_amount"], marker_color=ACCENT, name="수출금액"))
+    fig.update_layout(template=PLOTLY_TEMPLATE, height=340, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, width="stretch")
+
+    if has_price:
+        st.markdown("###### 단가 추이")
+        price_fig = go.Figure(
+            go.Scatter(x=hist["date"], y=hist["unit_price"], mode="lines+markers", line=dict(color=PRICE_COLOR, width=2), name="단가")
+        )
+        price_fig.update_layout(template=PLOTLY_TEMPLATE, height=300, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(price_fig, width="stretch")
+
+    with st.expander("원자료 테이블 보기"):
+        raw_cols = ["date", "export_amount", "unit_price", "prev_change_pct", "yoy", "price_yoy"]
+        raw_cols = [c for c in raw_cols if c in hist.columns]
+        raw_display = hist[raw_cols].sort_values("date", ascending=False).copy()
+        raw_display.rename(
+            columns={
+                "date": "기준일", "export_amount": "수출금액", "unit_price": "단가",
+                "prev_change_pct": "갱신 대비(%)", "yoy": "YoY(%)", "price_yoy": "단가YoY(%)",
+            },
+            inplace=True,
+        )
+        st.dataframe(raw_display, hide_index=True, width="stretch")
+
+
 # ---------- 사이드바: 간결한 네비게이션 / 다운로드 ----------
 with st.sidebar:
     st.markdown(f"##### 수출입 데이터")
@@ -1183,6 +1353,7 @@ with st.sidebar:
         ("board", "투자 시그널"),
         ("watchlist", "Watchlist"),
         ("all", "전체 품목"),
+        ("items_decade", "품목 커스텀 설정(10/20일)"),
         ("company_search", "기업 검색"),
     ]
     for key, label in nav_options:
@@ -1190,11 +1361,13 @@ with st.sidebar:
             st.session_state.view == key
             and st.session_state.selected_item is None
             and st.session_state.selected_company is None
+            and st.session_state.selected_decade_item is None
         )
         if st.button(label, key=f"nav_{key}", width="stretch", type="primary" if is_active else "secondary"):
             st.session_state.view = key
             st.session_state.selected_item = None
             st.session_state.selected_company = None
+            st.session_state.selected_decade_item = None
             st.rerun()
 
     st.divider()
@@ -1226,6 +1399,21 @@ with st.sidebar:
         else:
             st.caption("scrape_bigfinance.py 없음")
 
+        if SCRAPER_ITEMS_PATH.exists():
+            if st.button("품목 데이터 갱신 (10일)", width="stretch"):
+                # "품목 커스텀 설정" 화면(10일 단위) 전용 - 위 "데이터 갱신"과 동일한 방식으로
+                # scrape_bigfinance_items.py를 실행한다.
+                with st.spinner("scrape_bigfinance_items.py 실행 중... 크롬 창이 뜨면 필요 시 로그인해주세요 (터미널 확인)"):
+                    result = subprocess.run([sys.executable, str(SCRAPER_ITEMS_PATH)], cwd=str(BASE_DIR))
+                if result.returncode == 0:
+                    st.cache_data.clear()
+                    st.success("갱신 완료.")
+                    st.rerun()
+                else:
+                    st.error(f"갱신 스크립트가 오류로 종료됐습니다 (종료 코드 {result.returncode}).")
+        else:
+            st.caption("scrape_bigfinance_items.py 없음")
+
 
 # ---------- 메인 ----------
 render_status_bar()
@@ -1234,10 +1422,14 @@ if st.session_state.selected_company:
     render_company_detail(*st.session_state.selected_company)
 elif st.session_state.selected_item:
     render_detail(st.session_state.selected_item)
+elif st.session_state.selected_decade_item:
+    render_decade_detail(st.session_state.selected_decade_item)
 elif st.session_state.view == "watchlist":
     render_watchlist()
 elif st.session_state.view == "all":
     render_all_items()
+elif st.session_state.view == "items_decade":
+    render_items_decade()
 elif st.session_state.view == "company_search":
     render_company_search()
 else:

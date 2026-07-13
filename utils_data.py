@@ -21,6 +21,9 @@ from stock_codes import resolve_stock_code
 BASE_DIR = Path(__file__).parent
 HISTORY_PATH = BASE_DIR / "trade_history_long.csv"
 COMPANY_HISTORY_PATH = BASE_DIR / "company_trade_history_long.csv"
+# "품목 커스텀 설정" 화면(10일 단위 - 상순/중순/하순) 원본. trade_history_long.csv와 달리
+# 월말로 collapse하지 않아 한 품목당 한 달에 여러 행이 있을 수 있다.
+DECADE_HISTORY_PATH = BASE_DIR / "trade_history_decade_long.csv"
 MAPPING_PATH = BASE_DIR / "config" / "item_mapping.csv"
 FAVORITES_PATH = BASE_DIR / "favorites.json"
 MAPPING_COLUMNS = ["item_name", "category", "related_companies", "hs_code"]
@@ -197,6 +200,102 @@ def compute_item_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
     """품목별 최신 시점 1행만 추출 (카드/요약용)."""
+    latest = df_with_metrics.sort_values("date").groupby("item_name", as_index=False).tail(1)
+    return latest.reset_index(drop=True)
+
+
+# ---------- trade_history_decade_long.csv ("품목 커스텀 설정" - 10일 단위) ----------
+def load_decade_history() -> pd.DataFrame:
+    """trade_history_decade_long.csv를 로딩/정규화한다.
+
+    load_history()와 달리, 아직 scrape_bigfinance_items.py를 한 번도 돌리지 않아 파일이
+    없는 상태도 정상이므로(신규 데이터 소스) DataLoadError를 던지지 않고 조용히 빈
+    DataFrame을 반환한다 - load_company_history()와 동일한 방침이다.
+    """
+    empty = pd.DataFrame(columns=["item_name", "category", "date", "export_amount", "unit_price"])
+    if not DECADE_HISTORY_PATH.exists():
+        return empty
+    try:
+        raw = pd.read_csv(DECADE_HISTORY_PATH)
+    except Exception:
+        return empty
+    if raw.empty:
+        return empty
+
+    df = normalize_columns(raw)
+    if any(c not in df.columns for c in REQUIRED_COLUMNS):
+        return empty
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["export_amount"] = clean_numeric(df["export_amount"])
+    if "unit_price" in df.columns:
+        df["unit_price"] = clean_numeric(df["unit_price"])
+    if "category" not in df.columns:
+        df["category"] = df["item_name"].astype(str).str.split("_").str[0]
+
+    df = df.dropna(subset=["date", "item_name"]).copy()
+    df = df.sort_values(["item_name", "date"]).reset_index(drop=True)
+    return df
+
+
+def compute_decade_item_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """품목별로 정렬 후 10일 단위 스냅샷 기준 지표를 계산한다.
+
+    한 달에 스냅샷이 여러 개(상순/중순/하순) 있어 compute_item_metrics()처럼 (연,월)
+    기준으로는 비교할 수 없다. 대신 그 달의 몇 번째 스냅샷인지(occ_in_month)로 위치를
+    잡는다 - 공휴일 등으로 실제 보고일이 며칠 밀려도 "그 달의 N번째 갱신"이라는 상대
+    위치는 안정적이기 때문에, 상순/중순/하순을 날짜 임계값(예: 10일/20일)으로 추측하지
+    않는다.
+
+    - prev_change_pct: 바로 직전 스냅샷 대비 증감률 ("갱신 대비")
+    - yoy / price_yoy: 전년도 같은 달의 같은 순번(occ_in_month) 스냅샷 대비 증감률
+    """
+    has_price = "unit_price" in df.columns
+
+    def _pct(base, current) -> float:
+        if base is None or pd.isna(base) or base == 0 or current is None or pd.isna(current):
+            return np.nan
+        return (current - base) / base * 100
+
+    def _per_item(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values("date").copy()
+        g["month"] = g["date"].dt.to_period("M")
+        g["occ_in_month"] = g.groupby("month").cumcount() + 1
+
+        prev_amount = g["export_amount"].shift(1)
+        g["prev_change_pct"] = [
+            _pct(b, c) for b, c in zip(prev_amount, g["export_amount"])
+        ]
+
+        cur_key = list(zip(g["month"].apply(lambda p: p.year), g["month"].apply(lambda p: p.month), g["occ_in_month"]))
+        yoy_key = [(y - 1, m, occ) for y, m, occ in cur_key]
+
+        amount_bp = dict(zip(cur_key, g["export_amount"]))
+        g["yoy"] = [_pct(amount_bp.get(prev_k), amount_bp[k]) for k, prev_k in zip(cur_key, yoy_key)]
+
+        if has_price:
+            price_bp = dict(zip(cur_key, g["unit_price"]))
+            g["price_yoy"] = [_pct(price_bp.get(prev_k), price_bp[k]) for k, prev_k in zip(cur_key, yoy_key)]
+        else:
+            g["price_yoy"] = np.nan
+
+        return g.drop(columns=["month"])
+
+    parts = [_per_item(g) for _, g in df.groupby("item_name")]
+    if not parts:
+        return df.assign(
+            occ_in_month=pd.Series(dtype="int64"),
+            prev_change_pct=pd.Series(dtype="float64"),
+            yoy=pd.Series(dtype="float64"),
+            price_yoy=pd.Series(dtype="float64"),
+        )
+    return pd.concat(parts, ignore_index=True)
+
+
+def get_decade_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
+    """품목별 최신 스냅샷 1행만 추출 (품목 커스텀 설정 목록/카드용)."""
+    if df_with_metrics.empty:
+        return df_with_metrics
     latest = df_with_metrics.sort_values("date").groupby("item_name", as_index=False).tail(1)
     return latest.reset_index(drop=True)
 
