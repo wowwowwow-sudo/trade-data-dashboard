@@ -1,13 +1,17 @@
 """
 bigfinance.co.kr(EPIC Finance) "잠정 수출 품목 지역별 리스트"("품목 및 지역 커스텀
 설정") 페이지에서 품목별로 모달(차트)을 열어 "수출 금액"/"수출 단가"를 전체 기간(All)
-엑셀로 다운로드하고, 그 히스토리를 trade_history_long.csv에 누적하는 스크립트.
+엑셀로 다운로드하고, 그 히스토리를 trade_history_long.csv(월말 기준)와
+trade_history_decade_long.csv(10일/20일/월말 스냅샷 그대로)에 함께 누적하는 스크립트.
 같은 화면에서 하위 기업(지역) 행이 설정된 품목은 펼쳐서 기업별 데이터도 함께
-company_trade_history_long.csv에 누적한다.
+company_trade_history_long.csv(월말 기준)에 누적한다.
 
-이 화면 하나로 품목 레벨 + 기업 레벨을 모두 처리한다: 상위 품목 행은 "품목 커스텀
-설정" 화면과 동일한 목록이고 동일하게 .button__modal 다운로드 버튼을 가지고 있어서
-(2026-07-10 확인), 두 화면을 따로 방문할 필요가 없다.
+이 화면 하나로 품목 레벨(월말 + 10/20일 원본) + 기업 레벨을 모두 처리한다: 상위
+품목 행은 "품목 커스텀 설정" 화면과 동일한 목록이고 동일하게 .button__modal 다운로드
+버튼을 가지고 있어서(2026-07-10 확인), 두 화면을 따로 방문할 필요가 없다 - 예전에는
+"품목 커스텀 설정" 화면을 scrape_bigfinance_items.py로 별도 방문했지만, 다운로드
+파일 자체가 이미 10일/20일/월말 전체 히스토리라 이 화면 방문 한 번으로 충분하다는
+게 확인되어(2026-07-13) 통합했다.
 
 목록 페이지의 요약 테이블(최신월/전년동월/전월 5개 컬럼)만 읽는 대신, 품목별
 다운로드를 쓰는 이유: 다운로드 파일에는 2016년부터 월말 기준 전체 히스토리가
@@ -40,7 +44,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import TimeoutError as PWTimeoutError
 from playwright.sync_api import sync_playwright
 
-from append_snapshot import append_company_snapshot, append_snapshot
+from append_snapshot import append_company_snapshot, append_decade_snapshot, append_snapshot
 
 load_dotenv()
 
@@ -202,6 +206,15 @@ def _click_through_to_target(page, target_label: str) -> None:
         page.get_by_text(label, exact=True).first.click(timeout=10000)
         page.wait_for_timeout(500)
 
+    # 위 클릭 후에도 상단 "Launch Data" 드롭다운 패널이 열린 채로 남아 사이드바 전체를
+    # 가리는 경우가 있다(2026-07-13 확인: .auth/debug 덤프에서 "Launch Data" 탭이
+    # nav__menu__item.is--being-selected 상태로 잠겨있고, 사이드바의 "잠정 수출"
+    # dropdown은 계속 is--close였다). Escape + 마우스를 상단 nav 밖(사이드바 쪽)으로
+    # 옮겨 hover/선택 상태를 명시적으로 풀어준다 - 패널이 이미 닫혀 있으면 아무 효과 없음.
+    page.keyboard.press("Escape")
+    page.mouse.move(10, 400)
+    page.wait_for_timeout(300)
+
     sidebar = page.locator(".trass-trade__aside")
     sidebar.wait_for(timeout=10000)
     section = sidebar.locator(".menu__item", has_text="잠정 수출").first
@@ -354,12 +367,13 @@ def _ensure_row_expanded(page, row) -> None:
         page.wait_for_timeout(500)
 
 
-def scrape_items_and_companies(page) -> tuple[list[dict], list[dict]]:
-    """"품목 및 지역 커스텀 설정" 화면 한 번 방문으로 품목 레벨 데이터
-    (trade_history_long.csv용)와 하위 기업(지역) 데이터(company_trade_history_long.csv용)를
-    함께 수집한다. 이 화면의 상위 품목 행은 "품목 커스텀 설정" 화면과 동일한 목록이고
-    동일하게 .button__modal 다운로드 버튼을 가지고 있어(2026-07-10 확인), 두 화면을
-    따로 방문할 필요가 없다.
+def scrape_items_and_companies(page) -> tuple[list[dict], list[dict], list[dict]]:
+    """"품목 및 지역 커스텀 설정" 화면 한 번 방문으로 품목 레벨 데이터를 두 가지 해상도로
+    (trade_history_long.csv용 월말 + trade_history_decade_long.csv용 10일/20일/월말
+    원본 그대로) 모두 수집하고, 하위 기업(지역) 데이터(company_trade_history_long.csv용,
+    월말 기준)도 함께 수집한다. 이 화면의 상위 품목 행은 "품목 커스텀 설정" 화면과
+    동일한 목록이고 동일하게 .button__modal 다운로드 버튼을 가지고 있어(2026-07-10
+    확인), 두 화면을 따로 방문할 필요가 없다.
 
     한 품목에 하위 기업이 있는지는 펼치기 전에는 알 수 없다 (화면 기본 접힘/펼침
     상태와 무관 - probe_expand_full.py로 실제 확인함: IC칩처럼 접힌 채로 보이는
@@ -392,6 +406,7 @@ def scrape_items_and_companies(page) -> tuple[list[dict], list[dict]]:
     print(f"[정보] {n_top}개 품목을 순회하며 다운로드합니다 (품목당 수출금액+단가 2회 다운로드, 하위 기업 있으면 추가).")
 
     item_records: list[dict] = []
+    decade_records: list[dict] = []
     company_records: list[dict] = []
     n_done = 0
     n_with_companies = 0
@@ -428,6 +443,18 @@ def scrape_items_and_companies(page) -> tuple[list[dict], list[dict]]:
             except PWTimeoutError:
                 pass
             continue
+
+        # 10일/20일/월말 원본 그대로 (월말로 collapse하기 전) - trade_history_decade_long.csv용.
+        price_by_date_full = dict(zip(price_df["date"], price_df["value"]))
+        for _, r in export_df.sort_values("date").iterrows():
+            decade_records.append(
+                {
+                    "품목명": item_name,
+                    "기준일": r["date"].strftime("%Y-%m-%d"),
+                    "수출금액": r["value"],
+                    "단가": price_by_date_full.get(r["date"]),
+                }
+            )
 
         export_month = _month_end_rows(export_df)
         price_month = _month_end_rows(price_df)
@@ -504,12 +531,13 @@ def scrape_items_and_companies(page) -> tuple[list[dict], list[dict]]:
                 )
 
     print(
-        f"[정보] {n_done}/{n_top}개 품목 처리, 총 {len(item_records)}개 품목 레코드. "
+        f"[정보] {n_done}/{n_top}개 품목 처리, 총 {len(item_records)}개 월말 레코드 / "
+        f"{len(decade_records)}개 10일 단위 레코드. "
         f"하위 기업 보유 품목 {n_with_companies}개, 총 {len(company_records)}개 기업x월 레코드 추출."
     )
     if n_done == 0:
         raise RuntimeError("품목을 하나도 처리하지 못했습니다. 위 경고 메시지와 .auth/debug 폴더를 확인해주세요.")
-    return item_records, company_records
+    return item_records, decade_records, company_records
 
 
 def main() -> None:
@@ -523,7 +551,7 @@ def main() -> None:
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
-            records, company_records = scrape_items_and_companies(page)
+            records, decade_records, company_records = scrape_items_and_companies(page)
         finally:
             context.close()
 
@@ -534,6 +562,12 @@ def main() -> None:
     unique_records = list(seen.values())
 
     append_snapshot(unique_records)
+
+    seen_decade = {}
+    for r in decade_records:
+        seen_decade[(r["품목명"], r["기준일"])] = r
+    unique_decade_records = list(seen_decade.values())
+    append_decade_snapshot(unique_decade_records)
 
     if company_records:
         seen_company = {}

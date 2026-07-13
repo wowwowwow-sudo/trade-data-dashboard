@@ -204,11 +204,11 @@ def get_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
     return latest.reset_index(drop=True)
 
 
-# ---------- trade_history_decade_long.csv ("품목 커스텀 설정" - 10일 단위) ----------
+# ---------- trade_history_decade_long.csv ("품목 커스텀 설정" - 10/20일 단위) ----------
 def load_decade_history() -> pd.DataFrame:
     """trade_history_decade_long.csv를 로딩/정규화한다.
 
-    load_history()와 달리, 아직 scrape_bigfinance_items.py를 한 번도 돌리지 않아 파일이
+    load_history()와 달리, 아직 scrape_bigfinance.py를 한 번도 돌리지 않아 파일이
     없는 상태도 정상이므로(신규 데이터 소스) DataLoadError를 던지지 않고 조용히 빈
     DataFrame을 반환한다 - load_company_history()와 동일한 방침이다.
     """
