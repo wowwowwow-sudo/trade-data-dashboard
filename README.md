@@ -17,25 +17,42 @@ streamlit run app.py
 pip install -r requirements-scrape.txt
 ```
 
+## 데이터 소스와 화면 구성
+
+두 종류의 스크래핑 소스가 있다.
+
+- **`scrape_bigfinance.py`** — EPIC Finance "품목 및 지역 커스텀 설정" 화면. 품목별 + 그
+  하위 기업별 수출액을 함께 가져온다. 이 화면 다운로드는 매월 1일 갱신되는 월 1회
+  값뿐이라(2026-07-13 확인), 여기서만 **기업별 breakdown**을 얻을 수 있다.
+  → `trade_history_long.csv`(품목,월별), `company_trade_history_long.csv`(기업,월별)
+- **`scrape_bigfinance_items.py`** — EPIC Finance "품목 커스텀 설정" 화면. 품목만
+  나오지만 **10일/20일/월말(상순/중순/하순) 단위**로 갱신된다.
+  → `trade_history_decade_long.csv`(월말로 합치지 않은 순旬 스냅샷 그대로 누적)
+
+투자 시그널 보드/전체 품목 등 앱의 품목 계산은 `trade_history_decade_long.csv`를
+월별로 롤업한 값(월말 스냅샷)을 기본 소스로 쓴다 - 더 세분화됐고 항상 한 달 더
+최신인 상위 호환 데이터라서다. 품목 상세 화면의 "10/20일별 / 월별로 묶어보기"
+토글에서 순旬 단위 원본까지 파고들 수 있다. (사이드바에 별도 "품목 커스텀 설정"
+페이지를 두지 않고 상세 화면 토글로 통합했다.)
+
+기업별 데이터는 이 통합과 무관하게 품목 상세의 "관련 기업" 테이블 → 기업 상세
+드릴다운에서 그대로 쓴다.
+
 ## 데이터 갱신
-1. bigfinance.co.kr에 로그인 후 "잠정 수출 품목 리스트" 화면 확인
-2. 새 값을 `append_snapshot.py`의 `append_snapshot()`에 넘겨서 실행
-   (품목명/기준일 조합이 이미 있으면 최신 값으로 덮어쓰고, 없으면 새 행 추가)
-3. `trade_history_long.csv`가 갱신되고, 앱을 새로고침하면 반영됨
+
+로컬에서 아래 래퍼를 돌리면 git pull → 두 스크래퍼 실행 → interlink 발행 →
+변경분 commit/push까지 한 번에 처리된다.
+
+```
+python run_update.py
+```
+
+`scrape_bigfinance_items.py`는 아직 작업 스케줄러 자동 실행에는 넣지 않았다
+(안정화 후 등록 예정). 개별 스크래퍼를 직접 돌리려면:
+
+```
+python scrape_bigfinance.py        # 품목+기업, 월 1회
+python scrape_bigfinance_items.py  # 품목, 10/20/30일
+```
 
 품목이 쌓일수록 카드의 추이 막대(스파크라인)가 자동으로 길어집니다.
-
-## 품목 커스텀 설정 데이터 (10/20일 단위)
-
-사이드바 "품목 커스텀 설정(10/20일)" 페이지는 EPIC Finance "품목 커스텀 설정" 화면
-(상순/중순/하순 갱신)을 별도로 스크래핑한다. "품목 및 지역 커스텀 설정" 화면
-(`scrape_bigfinance.py`)의 다운로드는 매월 1일 갱신되는 월 1회 값뿐이라(2026-07-13
-확인), 10/20일 단위 데이터는 이 화면에서 가져올 수 없다.
-
-```
-python scrape_bigfinance_items.py
-```
-
-`trade_history_decade_long.csv`에 품목별 전체 히스토리(월말로 합치지 않은 10일/20일/월말
-스냅샷 그대로)가 누적된다. 로그인/모달 다운로드 방식은 `scrape_bigfinance.py`
-("품목 및 지역 커스텀 설정" 화면용)와 동일하다.

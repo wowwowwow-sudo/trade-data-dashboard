@@ -300,6 +300,37 @@ def get_decade_latest_snapshot(df_with_metrics: pd.DataFrame) -> pd.DataFrame:
     return latest.reset_index(drop=True)
 
 
+def rollup_decade_to_monthly(decade_df: pd.DataFrame) -> pd.DataFrame:
+    """trade_history_decade_long.csv(상순/중순/하순, 품목당 월 최대 3행)를 월말 스냅샷만
+    남겨 trade_history_long.csv와 같은 모양(품목당 월 1행)으로 접는다. load_history()가
+    반환하는 DataFrame과 컬럼이 동일해 compute_item_metrics()에 그대로 넣을 수 있다.
+
+    아직 하순/월말 보고가 안 들어와 진행 중인 달(예: 이번 달 10일치 스냅샷만 있는 경우)은
+    제외한다 - 안 그러면 그 부분월이 "그 달 전체 실적"인 것처럼 집계돼 직전월 대비
+    급락한 것으로 왜곡된다. 하순/월말 스냅샷은 항상 28일 이후로 찍히므로, 그 달의
+    마지막 스냅샷이 28일 이전이면 아직 완결되지 않은 달로 보고 뺀다."""
+    if decade_df.empty:
+        return decade_df
+    df = decade_df.sort_values(["item_name", "date"]).copy()
+    df["_period"] = df["date"].dt.to_period("M")
+    df = df.groupby(["item_name", "_period"], as_index=False).tail(1)
+    df = df[df["date"].dt.day >= 28]
+    return df.drop(columns="_period").sort_values(["item_name", "date"]).reset_index(drop=True)
+
+
+def load_history_from_decade() -> pd.DataFrame:
+    """투자 시그널 보드 등 기존에 trade_history_long.csv(월별)를 쓰던 곳의 기본 데이터
+    소스. trade_history_decade_long.csv가 더 세분화된 상위 호환 데이터라(월말 값이
+    거의 동일하고 항상 한 달 더 최신) 이걸 월별로 롤업해서 쓴다. trade_history_long.csv
+    자체는 당장 지우지 않고 남겨두되, 읽는 곳은 이쪽으로 교체한다."""
+    if not DECADE_HISTORY_PATH.exists():
+        raise DataLoadError(f"{DECADE_HISTORY_PATH.name} 파일을 찾을 수 없습니다. (경로: {DECADE_HISTORY_PATH})")
+    decade_df = load_decade_history()
+    if decade_df.empty:
+        raise DataLoadError(f"{DECADE_HISTORY_PATH.name}에 유효한 데이터가 없습니다.")
+    return rollup_decade_to_monthly(decade_df)
+
+
 # ---------- company_trade_history_long.csv (기업별 수출 - 일부 품목만 존재) ----------
 _COMPANY_EMPTY_COLUMNS = ["item_name", "company_name", "date", "export_amount", "unit_price"]
 
@@ -558,11 +589,14 @@ def get_missing_items(df: pd.DataFrame, mapping: pd.DataFrame) -> list[dict]:
 # ---------- 데이터 기준 정보 (모든 화면 상단에 고정 표시) ----------
 def get_data_status(df: pd.DataFrame, missing_items: list[dict]) -> dict:
     """데이터 기준월/잠정치 여부/마지막 업데이트 시각/출처/다음 업데이트 예정일을 계산.
-    '마지막 업데이트'는 별도 로그가 없어 trade_history_long.csv의 실제 파일 수정 시각을 쓴다
-    (파일이 실제로 언제 갱신됐는지를 그대로 반영하는 값이라 임의 추정이 아니다).
+    '마지막 업데이트'는 별도 로그가 없어 trade_history_decade_long.csv(이제 기본 데이터
+    소스)의 실제 파일 수정 시각을 쓴다 (파일이 실제로 언제 갱신됐는지를 그대로 반영하는
+    값이라 임의 추정이 아니다).
     '다음 업데이트 예정'은 작업 스케줄러 주기(10일)를 더한 추정치일 뿐, 확정 일정이 아니다."""
     latest_period = df["date"].max().to_period("M")
-    last_updated = datetime.fromtimestamp(HISTORY_PATH.stat().st_mtime) if HISTORY_PATH.exists() else None
+    last_updated = (
+        datetime.fromtimestamp(DECADE_HISTORY_PATH.stat().st_mtime) if DECADE_HISTORY_PATH.exists() else None
+    )
     next_update_estimate = (last_updated + timedelta(days=SCRAPE_INTERVAL_DAYS)) if last_updated else None
     return {
         "latest_period": str(latest_period),
