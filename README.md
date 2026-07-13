@@ -18,12 +18,15 @@ streamlit run app.py
 
 ## 품목 커스텀 설정 데이터 (10/20일 단위)
 
-사이드바 "품목 커스텀 설정(10/20일)" 페이지는 별도 화면을 방문하지 않는다.
-`scrape_bigfinance.py`("품목 및 지역 커스텀 설정" 화면)가 품목별로 받는 모달 다운로드
-파일 자체가 이미 2016년부터의 10일/20일/월말 전체 히스토리라, 한 번 방문으로
-`trade_history_long.csv`(월말 기준)와 `trade_history_decade_long.csv`(10일/20일/월말
-스냅샷 그대로)를 동시에 갱신한다.
+사이드바 "품목 커스텀 설정(10/20일)" 페이지는 EPIC Finance "품목 커스텀 설정" 화면
+(상순/중순/하순 갱신)을 별도로 스크래핑한다. "품목 및 지역 커스텀 설정" 화면
+(`scrape_bigfinance.py`)의 다운로드는 매월 1일 갱신되는 월 1회 값뿐이라(2026-07-13
+확인), 10/20일 단위 데이터는 이 화면에서 가져올 수 없다.
 
 ```
-python scrape_bigfinance.py
+python scrape_bigfinance_items.py
 ```
+
+`trade_history_decade_long.csv`에 품목별 전체 히스토리(월말로 합치지 않은 10일/20일/월말
+스냅샷 그대로)가 누적된다. 로그인/모달 다운로드 방식은 `scrape_bigfinance.py`
+("품목 및 지역 커스텀 설정" 화면용)와 동일하다.

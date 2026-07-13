@@ -75,6 +75,7 @@ ACTIVE_BORDER = "#2563EB"
 PLOTLY_TEMPLATE = "plotly_white"
 
 SCRAPER_PATH = BASE_DIR / "scrape_bigfinance.py"
+SCRAPER_ITEMS_PATH = BASE_DIR / "scrape_bigfinance_items.py"
 PAGE_SIZE_STEP = 12
 TOP_CARD_COUNT = 8
 CARD_COLS = 4
@@ -276,8 +277,8 @@ enriched_df = enrich_signal_board(latest_df)  # Signal Score/해석 태그 - 투
 missing_items = get_missing_items(history_df, mapping_df)
 data_status = get_data_status(history_df, missing_items)
 
-# "품목 커스텀 설정"(10/20일 단위) - scrape_bigfinance.py를 아직 안 돌렸으면 빈 DataFrame이고,
-# 이는 정상 상태이므로 앱을 막지 않는다(company 데이터와 동일한 방침).
+# "품목 커스텀 설정"(10/20일 단위) - scrape_bigfinance_items.py를 아직 안 돌렸으면 빈
+# DataFrame이고, 이는 정상 상태이므로 앱을 막지 않는다(company 데이터와 동일한 방침).
 decade_metrics_df = _load_decade_with_metrics()
 decade_latest_df = (
     decade_metrics_df.sort_values("date").groupby("item_name", as_index=False).tail(1)
@@ -1238,7 +1239,7 @@ def render_items_decade() -> None:
     if decade_latest_df.empty:
         st.info(
             "아직 수집된 데이터가 없습니다. 왼쪽 사이드바 \"설정\"에서 "
-            "\"데이터 갱신\"을 먼저 실행해주세요."
+            "\"품목 데이터 갱신 (10/20일)\"을 먼저 실행해주세요."
         )
         return
 
@@ -1397,7 +1398,22 @@ with st.sidebar:
                     st.error(f"갱신 스크립트가 오류로 종료됐습니다 (종료 코드 {result.returncode}).")
         else:
             st.caption("scrape_bigfinance.py 없음")
-        st.caption("\"데이터 갱신\" 한 번으로 월말 데이터와 품목 커스텀 설정(10/20일) 데이터를 함께 갱신합니다.")
+
+        if SCRAPER_ITEMS_PATH.exists():
+            if st.button("품목 데이터 갱신 (10/20일)", width="stretch"):
+                # "품목 커스텀 설정" 화면(10/20일 단위) 전용 - 위 "데이터 갱신"과 동일한 방식으로
+                # scrape_bigfinance_items.py를 실행한다. "품목 및 지역 커스텀 설정" 화면
+                # 다운로드는 월 1회 값뿐이라(2026-07-13 확인) 이 화면을 별도로 방문해야 한다.
+                with st.spinner("scrape_bigfinance_items.py 실행 중... 크롬 창이 뜨면 필요 시 로그인해주세요 (터미널 확인)"):
+                    result = subprocess.run([sys.executable, str(SCRAPER_ITEMS_PATH)], cwd=str(BASE_DIR))
+                if result.returncode == 0:
+                    st.cache_data.clear()
+                    st.success("갱신 완료.")
+                    st.rerun()
+                else:
+                    st.error(f"갱신 스크립트가 오류로 종료됐습니다 (종료 코드 {result.returncode}).")
+        else:
+            st.caption("scrape_bigfinance_items.py 없음")
 
 
 # ---------- 메인 ----------
