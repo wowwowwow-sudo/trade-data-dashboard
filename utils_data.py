@@ -9,6 +9,7 @@ trade_history_long.csv 로딩/정규화, YoY/MoM 계산, item_mapping.csv/favori
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,49 @@ DECADE_HISTORY_PATH = BASE_DIR / "trade_history_decade_long.csv"
 MAPPING_PATH = BASE_DIR / "config" / "item_mapping.csv"
 FAVORITES_PATH = BASE_DIR / "favorites.json"
 MAPPING_COLUMNS = ["item_name", "category", "related_companies", "hs_code"]
+
+
+# ---------- 데이터 소스 오버라이드 (로컬 파일 vs 원격 URL) ----------
+# 이 모듈을 다른 저장소(예: 동료 대시보드)에 이식했을 때, 수출입 데이터 CSV를 각자
+# 복제해 두는 대신 원본 public 저장소 한 곳에서 raw URL로 읽게 하기 위한 스위치.
+# TRADE_DATA_BASE_URL이 설정되면(끝 슬래시 제외) 세 개의 히스토리 CSV
+# (trade_history_long / trade_history_decade_long / company_trade_history_long)를
+# "{BASE}/{파일명}"으로 읽는다. 설정 안 하면 기존처럼 BASE_DIR의 로컬 파일을 읽는다.
+#   예) TRADE_DATA_BASE_URL=https://raw.githubusercontent.com/wowwowwow-sudo/trade-data-dashboard/main
+# item_mapping.csv/favorites.json처럼 설정/개인 전용(읽고 쓰는) 파일은 이 스위치와
+# 무관하게 항상 로컬을 쓴다.
+def _resolve_data_base_url() -> str:
+    url = os.environ.get("TRADE_DATA_BASE_URL", "").strip()
+    if not url:
+        # Streamlit Cloud에서는 환경변수 대신 Secrets 탭 값을 쓴다. streamlit이 없거나
+        # secrets가 비어도 조용히 넘어간다 (check_data.py 등 비-streamlit 실행 대비).
+        try:
+            import streamlit as st  # noqa: PLC0415
+
+            url = str(st.secrets.get("TRADE_DATA_BASE_URL", "")).strip()
+        except Exception:
+            url = ""
+    return url.rstrip("/")
+
+
+TRADE_DATA_BASE_URL = _resolve_data_base_url()
+
+
+def _data_source(path: Path) -> str:
+    """읽을 데이터 CSV의 실제 소스. TRADE_DATA_BASE_URL이 있으면 같은 파일명을 그 URL
+    아래로 돌리고(pandas가 http(s) URL을 직접 read_csv 한다), 없으면 로컬 경로를 쓴다."""
+    if TRADE_DATA_BASE_URL:
+        return f"{TRADE_DATA_BASE_URL}/{path.name}"
+    return str(path)
+
+
+def _data_available(path: Path) -> bool:
+    """로컬은 파일 존재로 판단하고, 원격 URL 모드면 존재 확인을 건너뛴다(매번 HEAD를
+    치지 않고 실제 read 시점에 검증 - 원격에 파일이 없으면 read_csv가 예외를 던져 각
+    로더의 기존 예외 처리로 넘어간다)."""
+    if TRADE_DATA_BASE_URL:
+        return True
+    return path.exists()
 
 # company_trade_history_long.csv 컬럼 별칭. item_mapping.csv의 related_companies(참고용
 # 텍스트, HS코드 매핑 137개 품목 전체)와는 다른 데이터다 - 이건 EPIC Finance "품목 및
@@ -110,11 +154,11 @@ def load_history() -> tuple[pd.DataFrame, bool]:
     반환: (정규화된 DataFrame, 순(旬)구간 컬럼 존재 여부)
     컬럼명이 예상과 다르면 DataLoadError를 발생시켜 app.py가 안내 메시지를 보여주게 한다.
     """
-    if not HISTORY_PATH.exists():
+    if not _data_available(HISTORY_PATH):
         raise DataLoadError(f"{HISTORY_PATH.name} 파일을 찾을 수 없습니다. (경로: {HISTORY_PATH})")
 
     try:
-        raw = pd.read_csv(HISTORY_PATH)
+        raw = pd.read_csv(_data_source(HISTORY_PATH))
     except Exception as e:
         raise DataLoadError(f"{HISTORY_PATH.name}을 읽는 중 오류가 발생했습니다: {e}") from e
 
@@ -213,10 +257,10 @@ def load_decade_history() -> pd.DataFrame:
     DataFrame을 반환한다 - load_company_history()와 동일한 방침이다.
     """
     empty = pd.DataFrame(columns=["item_name", "category", "date", "export_amount", "unit_price"])
-    if not DECADE_HISTORY_PATH.exists():
+    if not _data_available(DECADE_HISTORY_PATH):
         return empty
     try:
-        raw = pd.read_csv(DECADE_HISTORY_PATH)
+        raw = pd.read_csv(_data_source(DECADE_HISTORY_PATH))
     except Exception:
         return empty
     if raw.empty:
@@ -323,7 +367,7 @@ def load_history_from_decade() -> pd.DataFrame:
     소스. trade_history_decade_long.csv가 더 세분화된 상위 호환 데이터라(월말 값이
     거의 동일하고 항상 한 달 더 최신) 이걸 월별로 롤업해서 쓴다. trade_history_long.csv
     자체는 당장 지우지 않고 남겨두되, 읽는 곳은 이쪽으로 교체한다."""
-    if not DECADE_HISTORY_PATH.exists():
+    if not _data_available(DECADE_HISTORY_PATH):
         raise DataLoadError(f"{DECADE_HISTORY_PATH.name} 파일을 찾을 수 없습니다. (경로: {DECADE_HISTORY_PATH})")
     decade_df = load_decade_history()
     if decade_df.empty:
@@ -345,10 +389,10 @@ def load_company_history() -> pd.DataFrame:
     DataFrame을 반환한다 (호출부가 품목별 기업 카드 섹션을 그냥 숨기면 된다).
     """
     empty = pd.DataFrame(columns=_COMPANY_EMPTY_COLUMNS)
-    if not COMPANY_HISTORY_PATH.exists():
+    if not _data_available(COMPANY_HISTORY_PATH):
         return empty
     try:
-        raw = pd.read_csv(COMPANY_HISTORY_PATH)
+        raw = pd.read_csv(_data_source(COMPANY_HISTORY_PATH))
     except Exception:
         return empty
     if raw.empty:
@@ -594,8 +638,12 @@ def get_data_status(df: pd.DataFrame, missing_items: list[dict]) -> dict:
     값이라 임의 추정이 아니다).
     '다음 업데이트 예정'은 작업 스케줄러 주기(10일)를 더한 추정치일 뿐, 확정 일정이 아니다."""
     latest_period = df["date"].max().to_period("M")
+    # 원격 URL 모드에서는 로컬 파일 mtime이 의미가 없으므로(있어도 옛 복사본일 뿐)
+    # '마지막 업데이트'를 표시하지 않는다. 로컬 모드에서만 파일 수정 시각을 쓴다.
     last_updated = (
-        datetime.fromtimestamp(DECADE_HISTORY_PATH.stat().st_mtime) if DECADE_HISTORY_PATH.exists() else None
+        datetime.fromtimestamp(DECADE_HISTORY_PATH.stat().st_mtime)
+        if (not TRADE_DATA_BASE_URL and DECADE_HISTORY_PATH.exists())
+        else None
     )
     next_update_estimate = (last_updated + timedelta(days=SCRAPE_INTERVAL_DAYS)) if last_updated else None
     return {
